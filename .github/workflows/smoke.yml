@@ -1,0 +1,116 @@
+name: 线上自检
+
+# 部署完网页端后点一下它，会真的走一遍：首页 → 口令门 → 上传 → 等翻译 → 下载译文并检查内容。
+# 用的是仓库里的样例文件，一次大概花几厘钱。
+#
+# 需要的仓库 Secret：
+#   SITE_PASSWORD  ← 网页端的使用口令（和 Worker 上的 PASSWORD 一致）
+# 需要的仓库 Variable：
+#   WORKER_URL     ← 网页端地址（deploy.sh 会自动写好）
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_url:
+        description: 要检查的网页端地址（留空则用仓库 Variable 里的 WORKER_URL）
+        required: false
+      mode:
+        description: 用哪种输出形式自检
+        required: false
+        default: inplace
+        type: choice
+        options: [inplace, bilingual, ocr]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: 全链路自检
+        env:
+          WORKER: ${{ inputs.worker_url || vars.WORKER_URL }}
+          PW: ${{ secrets.SITE_PASSWORD }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          [ -n "$WORKER" ] || { echo "::error::没有网页端地址：请填 worker_url，或先跑 cf/deploy.sh"; exit 1; }
+          [ -n "$PW" ] || { echo "::error::仓库 Secret 里缺 SITE_PASSWORD"; exit 1; }
+          WORKER="${WORKER%/}"
+          echo "检查地址：$WORKER"
+
+          echo "── 1. 首页 ──"
+          code=$(curl -sS -o page.html -w '%{http_code}' --max-time 60 "$WORKER/")
+          [ "$code" = "200" ] || { echo "::error::首页返回 $code"; exit 1; }
+          grep -q "Aurora" page.html || { echo "::error::首页内容不对"; exit 1; }
+          echo "  200 且内容正常 ✓"
+
+          echo "── 2. 口令门 ──"
+          bad=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -H 'x-password: 故意写错' "$WORKER/api/verify")
+          [ "$bad" = "401" ] || { echo "::error::错误口令没有被拒绝（返回 $bad）"; exit 1; }
+          echo "  错误口令被拒（401）✓"
+          curl -fsS --max-time 60 -H "x-password: $PW" "$WORKER/api/verify" > /dev/null
+          echo "  正确口令通过 ✓"
+
+          echo "── 3. 上传样例并派活 ──"
+          resp=$(curl -fsS --max-time 300 -X PUT "$WORKER/api/upload" \
+            -H "x-password: $PW" -H 'x-filename: smoke-test.pdf' \
+            -H "x-mode: $MODE" -H 'x-target: 中文' \
+            --data-binary @samples/demo.pdf)
+          JOB=$(printf '%s' "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          echo "  任务号 $JOB"
+          echo "$JOB" > job.txt
+
+          echo "── 4. 等翻译（最多 15 分钟）──"
+          ready=0
+          for i in $(seq 1 90); do
+            st=$(curl -fsS --max-time 60 -H "x-password: $PW" "$WORKER/api/status?id=$JOB")
+            status=$(printf '%s' "$st" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+            note=$(printf '%s' "$st" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("note",""))')
+            echo "  [$i] $status $note"
+            if [ "$status" = "done" ]; then ready=1; printf '%s' "$st" > status.json; break; fi
+            if [ "$status" = "failed" ]; then echo "::error::任务失败：$note"; exit 1; fi
+            sleep 10
+          done
+          [ "$ready" = "1" ] || { echo "::error::等太久还没完成"; exit 1; }
+
+          echo "── 5. 下载译文并检查 ──"
+          curl -fsS --max-time 600 -o out.bin "$WORKER/api/download?id=$JOB&password=$PW"
+          ls -l out.bin
+          pip install -q pymupdf
+          python3 - <<'PY'
+          import json, re, sys
+          import fitz
+
+          stats = json.load(open("status.json")).get("stats") or {}
+          doc = fitz.open("out.bin")
+          text = "".join(p.get_text() for p in doc)
+          zh = len(re.findall(r"[\u4e00-\u9fff]", text))
+          math = "".join(s for s in "√∂∆⊂∈∑∫≈≤" if s in text)
+          print("  页数 %s，中文字符 %d，数学符号 %s" % (doc.page_count, zh, math or "（无）"))
+          print("  统计 %s" % json.dumps(stats, ensure_ascii=False))
+          if zh < 20:
+              print("::error::译文里几乎没中文，可疑"); sys.exit(1)
+          if len(math) < 6:
+              print("::error::数学符号丢了（只找到 %r）" % math); sys.exit(1)
+          print("  ✓ 译文内容正常")
+          PY
+
+          {
+            echo "## 线上自检通过"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 地址 | \`$WORKER\` |"
+            echo "| 任务 | \`$JOB\` |"
+            echo "| 模式 | $MODE |"
+          } >> "$GITHUB_STEP_SUMMARY"

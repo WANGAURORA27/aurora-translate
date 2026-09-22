@@ -16,7 +16,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 SECRETS="$REPO/.secrets"
 
-# wrangler 会往 ~/Library/Preferences 写日志，沙箱里没权限；统一指到工作区
+# wrangler 会往 ~/Library/Preferences 写日志，沙箱里没权限；统一指到工作区。
+# 注意：覆盖 HOME 之后 gh 会找不到登录态，所以先把真实 HOME 和令牌记下来。
+REAL_HOME="$HOME"
 CFTOOLS="$(cd "$REPO/.." && pwd)/cf-tools"
 if [ -x "$CFTOOLS/node_modules/.bin/wrangler" ]; then
   WRANGLER="$CFTOOLS/node_modules/.bin/wrangler"
@@ -27,19 +29,31 @@ else
   WRANGLER="$(command -v wrangler)"
 fi
 export WRANGLER_SEND_METRICS=false
+# secret put / deploy 都必须能读到 cf/wrangler.toml，统一在 cf/ 目录里执行
+wf() { ( cd "$HERE" && "$WRANGLER" "$@" ); }
 
 mkdir -p "$SECRETS"
+
 step() { printf '\n\033[1;34m== %s\033[0m\n' "$1"; }
 die() { printf '\033[31m%s\033[0m\n' "$1" >&2; exit 1; }
+
+# GitHub 令牌要在覆盖 HOME 之前取（gh 的登录态在 macOS 钥匙串里，依赖真实 HOME）
+if [ -f "$SECRETS/gh_pat" ]; then
+  GH_TOKEN_VALUE="$(tr -d ' \t\r\n' < "$SECRETS/gh_pat")"
+else
+  GH_TOKEN_VALUE="$(HOME="$REAL_HOME" gh auth token 2>/dev/null || true)"
+fi
+[ -n "$GH_TOKEN_VALUE" ] || die "没有可用的 GitHub 令牌：先 gh auth login，或把细粒度 PAT 放进 $SECRETS/gh_pat"
+export GH_TOKEN="$GH_TOKEN_VALUE"   # 后面的 gh 命令都用它，不再依赖 HOME
 
 [ -f "$SECRETS/cf_token" ] || die "缺少 $SECRETS/cf_token"
 export CLOUDFLARE_API_TOKEN="$(tr -d ' \t\r\n' < "$SECRETS/cf_token")"
 
-step "1/5 验证 Cloudflare 凭据"
+step "1/6 验证 Cloudflare 凭据"
 "$WRANGLER" whoami >/dev/null 2>&1 || die "Token 无效或权限不足，先跑：\"$WRANGLER\" whoami 看详细报错"
 echo "凭据可用 ✓"
 
-step "2/5 建 KV（任务记录 + 文件分块都存这里）"
+step "2/6 建 KV（任务记录 + 文件分块都存这里）"
 if grep -q "REPLACE_WITH_KV_ID" "$HERE/wrangler.toml"; then
   OUT=$("$WRANGLER" kv namespace create JOBS 2>&1) || { echo "$OUT"; die "KV 创建失败"; }
   echo "$OUT"
@@ -56,7 +70,7 @@ else
   echo "wrangler.toml 里已有 KV id，跳过"
 fi
 
-step "3/5 写三个密钥"
+step "3/6 写三个密钥"
 # 内部密钥：网页端与 GitHub Actions 之间用，自动生成
 if [ ! -f "$SECRETS/agent_key" ]; then
   openssl rand -hex 24 > "$SECRETS/agent_key"
@@ -73,29 +87,39 @@ if [ ! -f "$SECRETS/password" ]; then
 fi
 PASSWORD="$(tr -d '\r\n' < "$SECRETS/password")"
 
-# 触发 Actions 用的 GitHub 令牌
-if [ -f "$SECRETS/gh_pat" ]; then
-  GH_TOKEN_VALUE="$(tr -d ' \t\r\n' < "$SECRETS/gh_pat")"
-else
-  GH_TOKEN_VALUE="$(gh auth token 2>/dev/null || true)"
-fi
-[ -n "$GH_TOKEN_VALUE" ] || die "没有可用的 GitHub 令牌：先 gh auth login，或把细粒度 PAT 放进 $SECRETS/gh_pat"
-
-printf '%s' "$PASSWORD"   | "$WRANGLER" secret put PASSWORD  >/dev/null
-printf '%s' "$AGENT_KEY"  | "$WRANGLER" secret put AGENT_KEY >/dev/null
-printf '%s' "$GH_TOKEN_VALUE" | "$WRANGLER" secret put GH_TOKEN >/dev/null
+printf '%s' "$PASSWORD"   | wf secret put PASSWORD  >/dev/null
+printf '%s' "$AGENT_KEY"  | wf secret put AGENT_KEY >/dev/null
+printf '%s' "$GH_TOKEN_VALUE" | wf secret put GH_TOKEN >/dev/null
 echo "PASSWORD / AGENT_KEY / GH_TOKEN 已写入 ✓"
 
-step "4/5 部署 Worker"
-DEPLOY_LOG=$(cd "$HERE" && "$WRANGLER" deploy 2>&1)
-printf '%s\n' "$DEPLOY_LOG" | tail -6
+step "4/6 检查 workers.dev 子域名"
+ACCOUNT_ID=$(printf '%s' "$(wf whoami 2>/dev/null)" | grep -oE '[0-9a-f]{32}' | head -1)
+SUB=$(curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/subdomain" \
+  | python3 -c "import json,sys; print(((json.load(sys.stdin).get('result') or {}) or {}).get('subdomain') or '')" 2>/dev/null)
+if [ -z "$SUB" ]; then
+  WANT="${WORKER_SUBDOMAIN:-$(HOME="$REAL_HOME" gh api user -q .login 2>/dev/null | tr 'A-Z' 'a-z')}"
+  [ -n "$WANT" ] || die "账号还没有 workers.dev 子域名，请到 https://dash.cloudflare.com/$ACCOUNT_ID/workers/onboarding 注册一个后重跑"
+  echo "还没有子域名，尝试注册 $WANT …"
+  SUB=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/subdomain" \
+    -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' \
+    -d "{\"subdomain\":\"$WANT\"}" \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('result') or {}).get('subdomain') or '')" 2>/dev/null)
+  [ -n "$SUB" ] || die "$WANT 这个名字可能已被占用：换一个名字重跑，例如 WORKER_SUBDOMAIN=别的名字 bash cf/deploy.sh"
+  echo "已注册：$SUB ✓"
+else
+  echo "已有子域名：$SUB ✓"
+fi
+
+step "5/6 部署 Worker"
+DEPLOY_LOG=$(wf deploy 2>&1) || true
+printf '%s\n' "$DEPLOY_LOG" | tail -8
 URL=$(printf '%s' "$DEPLOY_LOG" | grep -oE 'https://[a-z0-9.-]+\.workers\.dev' | head -1)
 [ -n "$URL" ] || die "没能从部署输出里认出网址，请手动看一眼上面的输出"
 echo "网址：$URL"
 
-step "5/5 把网址与内部密钥同步给 GitHub Actions"
-gh variable set WORKER_URL --body "$URL" --repo "$(gh repo view --json nameWithOwner -q .nameWithOwner)" 2>/dev/null \
-  || gh variable set WORKER_URL --body "$URL"
+step "6/6 把网址与内部密钥同步给 GitHub Actions"
+gh variable set WORKER_URL --body "$URL"
 printf '%s' "$AGENT_KEY" | gh secret set AGENT_KEY
 echo "WORKER_URL / AGENT_KEY 已同步 ✓"
 

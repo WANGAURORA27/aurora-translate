@@ -12,7 +12,7 @@ enabled = true
 # 任务记录 + 文件分块（原件与译文都存这里，按 20MiB 切块）
 [[kv_namespaces]]
 binding = "JOBS"
-id = "REPLACE_WITH_KV_ID"
+id = "35f2a678dba04f4c8b10771f17d1d34a"
 
 # 走 KV 不需要绑银行卡。哪天你想升级成 R2（10GB 空间、文件更大），
 # 把下面三行的注释去掉、跑一次 wrangler deploy 就行 —— 代码会自动改用 R2，
