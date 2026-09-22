@@ -1,0 +1,50 @@
+# DocBridge 正式站点 · Caddy 配置
+#
+# 线上采用「独立子域名」方案（推荐）：不碰 同类项目 现有站点块，前端用相对 URL
+# 天然正确，也不需要 redir / handle_path 那些路径前缀的坑。
+#
+# 合并进 /etc/caddy/Caddyfile 后务必：
+#   cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak.$(date +%F)
+#   caddy validate --config /etc/caddy/Caddyfile     # 语法检查，必做
+#   systemctl reload caddy                          # reload，不要 restart
+
+# 同域部署的另一个站点（原有，保持不动）
+app.example.com {
+    reverse_proxy 127.0.0.1:8787
+    tls {
+        ca https://acme-v02.api.letsencrypt.org/directory
+    }
+}
+
+# DocBridge 文档翻译（PDF / Word）
+translate.example.com {
+    reverse_proxy 127.0.0.1:8788 {
+        # ★ 必须保留：关掉响应缓冲，否则前端 SSE 进度条会被憋住不动
+        #   （表现为「点了开始，进度条半天不动，最后一下跳到完成」）
+        flush_interval -1
+    }
+    tls {
+        ca https://acme-v02.api.letsencrypt.org/directory
+    }
+}
+
+# 注意：Caddy 首次启动就会为 translate.example.com 申请证书。
+# 若 DNS 还没解析到本机，ACME 会报 NXDOMAIN 并**每 60 秒自动重试**（最多 30 天），
+# 同类项目 不受影响。加完 A 记录后证书会自动签发，不需要再动服务器：
+#   translate.example.com.  A  203.0.113.10
+
+# ---------------------------------------------------------------- 备选方案
+# 若不想用子域名，也可以挂在现有域名的 /doc/ 路径下。此时这两行**都不是可选项**：
+#
+# app.example.com {
+#     redir /doc /doc/                       # 少了它，/doc 页面里的相对路径会解析到
+#                                            # 根目录 → 样式和接口全部 404
+#     handle_path /doc/* {                   # 剥掉前缀再转发，Flask 侧无需知道前缀
+#         reverse_proxy 127.0.0.1:8788 {
+#             flush_interval -1
+#         }
+#     }
+#     handle {
+#         reverse_proxy 127.0.0.1:8787       # 原有 同类项目，放最后兜底
+#     }
+# }

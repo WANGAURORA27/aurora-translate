@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DocBridge · 管理</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">🛠</div>
+    <div>
+      <h1>DocBridge <em>管理</em></h1>
+      <p class="sub">用量 · 任务 · 通道健康度（需要 ADMIN_TOKEN）</p>
+    </div>
+  </div>
+  <div class="top-actions"><a class="ghost" href="./">← 返回翻译</a></div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>访问令牌</h2>
+    <p class="hint">令牌即服务端启动时的 <code>ADMIN_TOKEN</code>；只保存在这台浏览器的地址栏/本地，不会发给第三方。</p>
+    <div class="row">
+      <label>ADMIN_TOKEN<input id="token" type="password" placeholder="粘贴令牌" /></label>
+    </div>
+    <div class="actions">
+      <button id="btnLoad" class="primary">载入数据</button>
+      <button id="btnReset" class="ghost">重置当日用量</button>
+      <span id="msg" class="hint" style="margin:0"></span>
+    </div>
+  </section>
+
+  <section class="card" id="cardUsage" hidden>
+    <h2>当日用量</h2>
+    <div class="statgrid" id="usageStats"></div>
+  </section>
+
+  <section class="card" id="cardHealth" hidden>
+    <h2>通道与管线</h2>
+    <div id="health" class="hint" style="margin:0"></div>
+  </section>
+
+  <section class="card" id="cardJobs" hidden>
+    <h2>最近任务</h2>
+    <div class="hist" id="jobs"></div>
+  </section>
+</main>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const token = () => $('token').value.trim();
+const fmtSize = (n) => { if (n == null) return '—'; const u=['B','KB','MB','GB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n.toFixed(0))+u[i]; };
+
+async function load() {
+  const t = token();
+  if (!t) { $('msg').textContent = '请先填令牌'; return; }
+  localStorage.setItem('docbridge_admin_token', t);
+  $('msg').textContent = '载入中…';
+  let d;
+  try {
+    const r = await fetch('api/admin/overview?token=' + encodeURIComponent(t));
+    d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  } catch (e) { $('msg').textContent = '失败：' + e.message; return; }
+  $('msg').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+
+  const u = d.usage, tot = u.total, cost = u.cost;
+  $('cardUsage').hidden = false;
+  $('usageStats').innerHTML = [
+    ['日期', u.day], ['任务数', tot.jobs], ['调用次数', tot.calls],
+    ['送入字符', tot.charsIn], ['译文字符', tot.charsOut],
+    ['未译处', tot.failed], ['页数合计', tot.pages], ['来源 IP', u.ips],
+    ['≈ tokens 入', cost.tokensIn], ['≈ tokens 出', cost.tokensOut],
+    ['≈ 成本(元)', cost.yuan],
+  ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v ?? '—'}</div></div>`).join('');
+
+  $('cardHealth').hidden = false;
+  const errs = d.pipelineErrors || [];
+  $('health').innerHTML = `运行时长 ${Math.round(d.uptime / 60)} 分钟 · 排队 ${d.queue.queued} · 翻译中 ${d.queue.running} · 版本 ${d.version}<br>` +
+    (errs.length ? `<span class="err">管线加载失败：${errs.join('；')}</span>` : '<span class="val">所有管线正常加载</span>');
+
+  const label = { queued: '排队中', running: '翻译中', done: '已完成', error: '失败', canceled: '已取消' };
+  $('cardJobs').hidden = false;
+  $('jobs').innerHTML = (d.recent || []).map((j) => {
+    const dl = j.status === 'done' && j.result ? `<a class="ghostlink" href="api/jobs/${j.id}/download">下载</a>` : '';
+    return `<div class="hitem"><div class="nm">${j.srcName}
+      <div class="hint" style="margin:2px 0 0">${new Date(j.created*1000).toLocaleString('zh-CN',{hour12:false})}
+      · ${j.format}/${j.mode} · ${fmtSize(j.srcSize)} · 用时 ${j.elapsed}s · #${j.id}</div></div>
+      <div style="display:flex;gap:10px;align-items:center">
+      <span class="pill ${j.status}">${label[j.status] || j.status}</span>${dl}</div></div>`;
+  }).join('') || '<div class="hint" style="margin:0">暂无任务</div>';
+}
+
+async function reset() {
+  const t = token();
+  if (!t) { $('msg').textContent = '请先填令牌'; return; }
+  if (!confirm('确定把当日用量清零？此操作不可撤销。')) return;
+  const r = await fetch('api/usage/reset?token=' + encodeURIComponent(t), { method: 'POST' });
+  $('msg').textContent = r.ok ? '已重置' : '重置失败';
+  load();
+}
+
+$('btnLoad').addEventListener('click', load);
+$('btnReset').addEventListener('click', reset);
+$('token').value = localStorage.getItem('docbridge_admin_token') || '';
+if ($('token').value) load();
+</script>
+</body>
+</html>

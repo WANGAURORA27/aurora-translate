@@ -1,0 +1,236 @@
+name: 文档翻译
+
+# 怎么用：在仓库里新建 Issue（选「📄 翻译文档」模板）→ 把文件拖进去 → 等机器人回复下载链接。
+# 只有仓库所有者与协作者（Collaborator）能触发；其他人提交会被机器人礼貌拒绝。
+#
+# 需要的仓库 Secret：
+#   PROFILES_JSON  ← 你的 profiles.json 全文（含 API 密钥），见 README 的配置说明
+# 可选：
+#   DEFAULT_PROFILE  指定默认用哪个通道代号（不设则用 profiles 里第一个可用的）
+
+on:
+  issues:
+    types: [opened, edited]
+  workflow_dispatch:            # 手动跑（自己调试用）
+    inputs:
+      file_url:
+        description: 文件直链（GitHub 附件链接或任何可公开下载的 URL）
+        required: true
+      mode:
+        description: 输出形式
+        required: false
+        default: inplace
+        type: choice
+        options: [inplace, bilingual, ocr]
+
+permissions:
+  contents: write               # 把译文推到 results 分支
+  issues: write                 # 在 Issue 下评论、打标签
+
+# 同一个 Issue 只跑一个任务；不同 Issue 可以并行
+concurrency:
+  group: aurora-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  translate:
+    # 只处理带 translate 标签的 Issue（Issue 模板会自动打上这个标签）
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.issue.labels.*.name, 'translate')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # ── 1. 身份校验：公开仓库任何人都能开 Issue，这里把住"谁能用我的密钥" ──
+      - name: 身份校验
+        id: gate
+        env:
+          ASSOC: ${{ github.event.issue.author_association }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          ISSUE: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          case "$ASSOC" in
+            OWNER|MEMBER|COLLABORATOR) echo "ok=1" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "ok=0" >> "$GITHUB_OUTPUT"
+              gh issue comment "$ISSUE" --body "抱歉，这个仓库的翻译额度只对**协作者**开放（当前身份：\`$ASSOC\`）。想自己用的话，可以 fork 这个仓库并配上你自己的 API 密钥，方法见 README。"
+              gh issue close "$ISSUE"
+              ;;
+          esac
+
+      - name: 解析 Issue 里的文件与选项
+        if: steps.gate.outputs.ok == '1'
+        id: parse
+        env:
+          BODY: ${{ github.event.issue.body }}
+          MANUAL_URL: ${{ inputs.file_url }}
+          MANUAL_MODE: ${{ inputs.mode }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          body = os.environ.get("BODY") or ""
+          manual = os.environ.get("MANUAL_URL") or ""
+          mode = (os.environ.get("MANUAL_MODE") or "").strip()
+
+          def section(name):
+              """从 Issue 表单渲染出的 markdown 里取某一节的内容。"""
+              m = re.search(r"###\s*%s\s*\n+(.*?)(?=\n###|\Z)" % re.escape(name), body, re.S)
+              return (m.group(1).strip() if m else "")
+
+          pattern = (r"https://(?:github\.com/user-attachments/assets/[\w.-]+"
+                     r"|user-images\.githubusercontent\.com/[\w./%-]+"
+                     r"|github\.com/[\w.-]+/[\w.-]+/files/\d+/[\w.-]+)")
+          urls = re.findall(pattern, body)
+          if manual:
+              urls.insert(0, manual.strip())
+
+          mode_text = section("输出形式") or mode or "原位版式保留"
+          if "OCR" in mode_text or "ocr" in mode_text.lower():
+              mode = "ocr"
+          elif "双语" in mode_text or "bilingual" in mode_text.lower():
+              mode = "bilingual"
+          else:
+              mode = "inplace"
+
+          target = section("目标语言") or "简体中文"
+          target = {"繁體中文": "zh-Hant", "English": "en"}.get(target, "zh-Hans")
+
+          if not urls:
+              print("::error::Issue 里没有找到文件链接（请把 PDF/DOCX 直接拖进「文件」框）")
+              sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("url=%s\n" % urls[0])
+              fh.write("urls=%s\n" % " ".join(urls))
+              fh.write("mode=%s\n" % mode)
+              fh.write("target=%s\n" % target)
+          print("文件链接：", urls[0])
+          print("模式：", mode, "目标语言：", target)
+          PY
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.ok == '1'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.ok == '1'
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      # ── 2. 装系统依赖：OCR 引擎与中文字体（PDF 翻译与扫描件都要用）──
+      - name: 安装系统依赖
+        if: steps.gate.outputs.ok == '1'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
+               fonts-arphic-uming fonts-dejavu-core
+
+      - name: 安装 Python 依赖
+        if: steps.gate.outputs.ok == '1'
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q -r requirements.txt
+
+      - name: 下载待翻译文件
+        if: steps.gate.outputs.ok == '1'
+        id: fetch
+        env:
+          URL: ${{ steps.parse.outputs.url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          # 从 URL 猜扩展名，猜不到就按 PDF 处理
+          ext=$(echo "$URL" | grep -oiE '\.(pdf|docx)(\?|$)' | head -1 | tr -d '?')
+          [ -n "$ext" ] || ext=".pdf"
+          curl -fL --retry 3 --max-time 600 -o "work/input$ext" "$URL"
+          size=$(stat -c%s "work/input$ext")
+          echo "来源：$URL"
+          echo "大小：$((size/1024)) KB"
+          if [ "$size" -gt $((25*1024*1024)) ]; then
+            echo "::error::文件超过 25MB（GitHub 附件上限），请拆分后再传"; exit 1
+          fi
+          echo "name=input$ext" >> "$GITHUB_OUTPUT"
+
+      - name: 翻译
+        if: steps.gate.outputs.ok == '1'
+        id: run
+        env:
+          DOCBRIDGE_PROFILES_JSON: ${{ secrets.PROFILES_JSON }}
+          DEFAULT_PROFILE: ${{ vars.DEFAULT_PROFILE }}
+          MODE: ${{ steps.parse.outputs.mode }}
+          TARGET: ${{ steps.parse.outputs.target }}
+          NAME: ${{ steps.fetch.outputs.name }}
+        run: |
+          set -euo pipefail
+          out="work/${NAME%.*}_${MODE}${NAME##*.}"
+          python3 tools/translate_cli.py \
+            --input "work/$NAME" --output "$out" \
+            --mode "$MODE" --target "$TARGET" \
+            --profile "${DEFAULT_PROFILE:-}" \
+            --options '{"prefetch": true, "shared_cache": false}'
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+
+      # ── 3. 交付：推到 results 分支（公开仓库可直接用链接下载）+ 附 artifact ──
+      - name: 发布译文到 results 分支
+        if: steps.gate.outputs.ok == '1' && success()
+        env:
+          OUT: ${{ steps.run.outputs.out }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          base=$(basename "$OUT")
+          dest="results/${ISSUE:-manual}"
+          git config user.name "aurora-translate[bot]"
+          git config user.email "actions@users.noreply.github.com"
+          git fetch origin results --depth=1 2>/dev/null || true
+          if git show-ref --verify --quiet refs/remotes/origin/results; then
+            git checkout -q -b results origin/results
+          else
+            git checkout -q --orphan results && git rm -rq --cached . || true
+          fi
+          mkdir -p "$dest"
+          cp "$OUT" "$dest/$base"
+          git add -f "$dest/$base"
+          git commit -qm "翻译结果：$base（来自 Issue ${ISSUE:-手动触发}）"
+          git push -q origin results
+          echo "raw=https://github.com/${GITHUB_REPOSITORY}/raw/results/$dest/$base" >> "$GITHUB_OUTPUT"
+        id: publish
+
+      - uses: actions/upload-artifact@v4
+        if: steps.gate.outputs.ok == '1' && success()
+        with:
+          name: translated-${{ github.event.issue.number || github.run_id }}
+          path: ${{ steps.run.outputs.out }}
+          retention-days: 7
+
+      # ── 4. 回帖 ──
+      - name: 在 Issue 下回复下载链接
+        if: steps.gate.outputs.ok == '1' && success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ github.event.issue.number }}
+          RAW: ${{ steps.publish.outputs.raw }}
+        run: |
+          [ -n "$ISSUE" ] || exit 0
+          gh issue comment "$ISSUE" --body "✅ **翻译完成**
+
+          **直接下载**：$RAW
+          （公开仓库无需登录；链接来自 \`results\` 分支，7 天后会被定时任务清理）
+
+          工作流运行记录（含完整日志与统计）：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          gh issue edit "$ISSUE" --add-label "已完成" 2>/dev/null || true
+          gh issue close "$ISSUE"
+
+      - name: 失败时在 Issue 下说明原因
+        if: steps.gate.outputs.ok == '1' && failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          [ -n "$ISSUE" ] || exit 0
+          gh issue comment "$ISSUE" --body "❌ 翻译失败。请点上面的运行记录查看日志；
+          常见原因：文件加密/损坏、超过 25MB、密钥额度不足、或这份 PDF 需要改用「扫描版 OCR」模式。"

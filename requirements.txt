@@ -1,0 +1,15 @@
+# DocBridge 运行依赖
+#
+# 服务端需要 Python ≥3.10。既有 pdf_translate.py 也依赖 PyMuPDF，版本保持一致。
+# 安装（推荐虚拟环境，别污染系统 Python）：
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+flask>=3.0
+pymupdf>=1.24          # PDF 解析与重绘（与既有 pdf_translate.py 同款）
+python-docx>=1.1       # Word 段落/表格/页眉页脚读写
+lxml>=5.0              # python-docx 的 xml 后端
+
+# 生产用 WSGI 服务器（可选，但推荐）。
+# 不装也能跑：app.py 会自动退回 Flask 自带的开发服务器（线程模式）。
+# 正式对外建议装上，并用 deploy/docbridge.service 的 waitress 路径启动。
+waitress>=3.0

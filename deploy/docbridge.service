@@ -1,0 +1,65 @@
+# DocBridge 开机自启（与线上实际部署一致）
+# 放到 /etc/systemd/system/docbridge.service，然后：
+#   systemctl daemon-reload && systemctl enable --now docbridge
+#   journalctl -u docbridge -f
+
+[Unit]
+Description=DocBridge 文档翻译（PDF / Word）
+After=network.target
+
+[Service]
+Type=simple
+# 与 同类项目 保持一致用 root：这样能直接读 /opt/livebridge/profiles.json
+# （600 root:root），不必去改密钥文件的属主/权限
+User=root
+WorkingDirectory=/opt/docbridge
+
+Environment=PORT=8788
+Environment=HOST=127.0.0.1
+
+# 在 Caddy 后面，信任 X-Forwarded-For，否则用量统计里所有请求都是 127.0.0.1
+Environment=DOCBRIDGE_TRUST_PROXY=1
+
+# ★ 本站自己的模型/密钥配置：与同域部署的另一个项目**分开两条线**，互不影响。
+#   换本站的模型不会动到语音站；代价是密钥两份文件各一份，换密钥要改两处。
+Environment=PROFILES_FILE=/opt/docbridge/profiles.json
+
+# ★ 中文 PDF 字体：**这一条有两个坑，别随手改成 Noto CJK**
+#
+#   坑一（字体缺失）：不指定的话 Linux 上会退回 PyMuPDF 内置的 china-s，
+#     双语模式下译文「看得见但复制出来是乱码」（缺 ToUnicode 映射）。
+#   坑二（字体选错）：要用 **TrueType 轮廓**的中文字体。Noto CJK 是 CFF/OTF 轮廓，
+#     PyMuPDF 的字体子集化对它无效，整份 ~20MB 字体会被嵌进每一份输出。
+#     实测同一份 2 页样例的双语输出：
+#         Noto Serif CJK → 19.6MB      uming 明体 → 61KB      wqy-zenhei → 25KB
+#
+#   安装：apt install fonts-arphic-uming fonts-wqy-zenhei
+#   明体是宋体风格，与既有 pdf_translate.py 在 macOS 上用的宋体观感一致。
+#   app.py 启动时也会自动探测（候选清单见 pipelines/fonts.py）并打进启动日志。
+Environment=DOCBRIDGE_PDF_FONT=/usr/share/fonts/truetype/arphic/uming.ttc
+
+# 页头「🎙 同声传译」互链（留空则不显示该按钮）
+Environment=DOCBRIDGE_LIVE_URL=https://app.example.com/
+
+# 管理接口令牌：改成你自己的；不设则管理接口整体关闭
+# 生成：openssl rand -hex 16
+Environment=ADMIN_TOKEN=change-me-please
+
+# 并行任务数：PDF 原位管线内部要临时替换上游模块的全局函数，串行最稳
+Environment=DOCBRIDGE_WORKERS=1
+Environment=DOCBRIDGE_MAX_UPLOAD_MB=150
+Environment=DOCBRIDGE_JOB_TTL_HOURS=6
+
+# 单次批量翻译对上游的并发请求数，太高容易被限流
+Environment=TRANSLATE_CONCURRENCY=3
+
+# 成本估算单价（元 / 百万 token），按你实际用的模型改
+Environment=TR_PRICE_IN=1.0
+Environment=TR_PRICE_OUT=2.0
+
+ExecStart=/opt/docbridge/.venv/bin/python app.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

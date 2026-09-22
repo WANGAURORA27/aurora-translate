@@ -1,0 +1,45 @@
+name: 清理过期译文
+
+# results 分支上的译文链接保留 7 天（README 里承诺过），这里定时清理。
+# 也可以手动触发：Actions → 清理过期译文 → Run workflow
+
+on:
+  schedule:
+    - cron: "17 4 * * *"      # 每天 UTC 04:17（北京时间 12:17）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: results
+          fetch-depth: 0          # 需要每个文件的提交时间
+
+      - name: 删除 7 天前的译文
+        run: |
+          set -euo pipefail
+          git config user.name "aurora-translate[bot]"
+          git config user.email "actions@users.noreply.github.com"
+          now=$(date +%s)
+          removed=0
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            ts=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo "$now")
+            age=$(( now - ts ))
+            if [ "$age" -gt $((7*24*3600)) ]; then
+              git rm -q "$f"
+              removed=$((removed+1))
+            fi
+          done < <(git ls-files)
+          if [ "$removed" -gt 0 ]; then
+            git commit -qm "清理 $removed 个过期译文（保留 7 天）"
+            git push -q origin results
+            echo "已清理 $removed 个文件"
+          else
+            echo "没有过期文件"
+          fi
