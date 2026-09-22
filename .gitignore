@@ -7,3 +7,7 @@ _cache/
 usage.json
 __pycache__/
 tests/_tmp/
+
+# 临时凭据（API token 等）：绝不入库
+.secrets/
+.tools/
