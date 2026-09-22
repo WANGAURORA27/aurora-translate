@@ -166,7 +166,10 @@ jobs:
           NAME: ${{ steps.fetch.outputs.name }}
         run: |
           set -euo pipefail
-          out="work/${NAME%.*}_${MODE}${NAME##*.}"
+          # 注意 `${NAME##*.}` 只给出扩展名、**不含点号**，少写一个点就会产出没有后缀的文件
+          stem="${NAME%.*}"
+          ext="${NAME##*.}"
+          out="work/${stem}_${MODE}.${ext}"
           python3 tools/translate_cli.py \
             --input "work/$NAME" --output "$out" \
             --mode "$MODE" --target "$TARGET" \
