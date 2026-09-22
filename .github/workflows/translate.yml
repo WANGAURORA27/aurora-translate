@@ -82,6 +82,15 @@ jobs:
               m = re.search(r"###\s*%s\s*\n+(.*?)(?=\n###|\Z)" % re.escape(name), body, re.S)
               return (m.group(1).strip() if m else "")
 
+          # GitHub 把附件渲染成 [原文件名.pdf](附件URL)，链接文字就是书名 —— 用它给产物命名
+          md = re.search(r"\[([^\]\n]{1,160}?\.(?:pdf|docx))\]"
+                         r"\((https://github\.com/user-attachments/assets/[^)\s]+)\)",
+                         body, re.I)
+          name_hint = ""
+          if md:
+              name_hint = md.group(1).strip()
+              urls.insert(0, md.group(2))
+
           pattern = (r"https://(?:github\.com/user-attachments/assets/[\w.-]+"
                      r"|user-images\.githubusercontent\.com/[\w./%-]+"
                      r"|github\.com/[\w.-]+/[\w.-]+/files/\d+/[\w.-]+)")
@@ -108,6 +117,7 @@ jobs:
               fh.write("urls=%s\n" % " ".join(urls))
               fh.write("mode=%s\n" % mode)
               fh.write("target=%s\n" % target)
+              fh.write("name=%s\n" % re.sub(r"[^\w.\- ]+", "_", name_hint)[:80])
           print("文件链接：", urls[0])
           print("模式：", mode, "目标语言：", target)
           PY
@@ -140,20 +150,25 @@ jobs:
         id: fetch
         env:
           URL: ${{ steps.parse.outputs.url }}
+          HINT: ${{ steps.parse.outputs.name }}
         run: |
           set -euo pipefail
           mkdir -p work
-          # 从 URL 猜扩展名，猜不到就按 PDF 处理
+          # 从 URL 猜扩展名；猜不到就看原文件名的后缀，再不行按 PDF
           ext=$(echo "$URL" | grep -oiE '\.(pdf|docx)(\?|$)' | head -1 | tr -d '?')
+          if [ -z "$ext" ] && [ -n "$HINT" ]; then ext=".${HINT##*.}"; fi
           [ -n "$ext" ] || ext=".pdf"
-          curl -fL --retry 3 --max-time 600 -o "work/input$ext" "$URL"
-          size=$(stat -c%s "work/input$ext")
+          curl -fL --retry 3 --max-time 600 -o "work/_dl$ext" "$URL"
+          size=$(stat -c%s "work/_dl$ext")
           echo "来源：$URL"
           echo "大小：$((size/1024)) KB"
           if [ "$size" -gt $((25*1024*1024)) ]; then
             echo "::error::文件超过 25MB（GitHub 附件上限），请拆分后再传"; exit 1
           fi
-          echo "name=input$ext" >> "$GITHUB_OUTPUT"
+          # 保留原文件名（便于用户认出是哪本书）；没有就退回 input.<ext>
+          if [ -n "$HINT" ]; then base="${HINT%.*}$ext"; else base="input$ext"; fi
+          mv "work/_dl$ext" "work/$base"
+          echo "name=$base" >> "$GITHUB_OUTPUT"
 
       - name: 翻译
         if: steps.gate.outputs.ok == '1'
