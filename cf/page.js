@@ -82,7 +82,7 @@ export const PAGE = `<!DOCTYPE html>
       </div>
       <div style="margin-top:16px"><button id="upbtn">开始翻译</button></div>
       <div class="bar hidden" id="ubar"><i></i></div>
-      <p class="tip" id="upnote">单个文件最大 95MB。30 页大约 1 分钟，几百页的教材会久一些。</p>
+      <p class="tip" id="upnote">单个文件最大 95MB。30 页大约 1 分钟，几百页的教材会久一些。译文保留 3 天，请及时下载。</p>
     </div>
 
     <div class="card hidden" id="jobcard">

@@ -6,13 +6,15 @@
 #   2. gh 已登录，且当前目录是 aurora-translate 仓库
 #   3. .secrets/password 里写你给使用者用的口令（没有则自动生成一个并打印）
 #
+# 存储走 Workers KV，不需要绑银行卡；以后想换 R2 只需在 wrangler.toml 里
+# 去掉 r2_buckets 的注释再跑一次。
+#
 # 用法：bash cf/deploy.sh
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 SECRETS="$REPO/.secrets"
-BUCKET="aurora-files"
 
 # wrangler 会往 ~/Library/Preferences 写日志，沙箱里没权限；统一指到工作区
 CFTOOLS="$(cd "$REPO/.." && pwd)/cf-tools"
@@ -33,30 +35,11 @@ die() { printf '\033[31m%s\033[0m\n' "$1" >&2; exit 1; }
 [ -f "$SECRETS/cf_token" ] || die "缺少 $SECRETS/cf_token"
 export CLOUDFLARE_API_TOKEN="$(tr -d ' \t\r\n' < "$SECRETS/cf_token")"
 
-step "1/7 验证 Cloudflare 凭据"
+step "1/5 验证 Cloudflare 凭据"
 "$WRANGLER" whoami >/dev/null 2>&1 || die "Token 无效或权限不足，先跑：\"$WRANGLER\" whoami 看详细报错"
 echo "凭据可用 ✓"
 
-step "2/7 检查 R2 是否已开通"
-# R2 要先在面板里手动开通（免费额度 10GB/月，出站不收费），否则建桶时报的错看不懂
-ACCOUNT_ID=$(printf '%s' "$("$WRANGLER" whoami 2>/dev/null)" | grep -oE '[0-9a-f]{32}' | head -1)
-R2_CHECK=$(curl -s -w '\n%{http_code}' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/r2/buckets")
-if [ "$(printf '%s' "$R2_CHECK" | tail -1)" != "200" ]; then
-  printf '%s' "$R2_CHECK" | head -1 | python3 -c "
-import json,sys
-try:
-    d = json.load(sys.stdin)
-    print('  Cloudflare 说：', ((d.get('errors') or [{}])[0].get('message') or '')[:120])
-except Exception:
-    pass
-" 2>/dev/null || true
-  die "R2 还没开通。请打开 https://dash.cloudflare.com/$ACCOUNT_ID/r2 点开通（免费额度 10GB，
-出站流量不收费；需要绑一张卡，免费额度内不会扣费），然后重跑本脚本。"
-fi
-echo "R2 已开通 ✓"
-
-step "3/7 建 KV（存任务进度）"
+step "2/5 建 KV（任务记录 + 文件分块都存这里）"
 if grep -q "REPLACE_WITH_KV_ID" "$HERE/wrangler.toml"; then
   OUT=$("$WRANGLER" kv namespace create JOBS 2>&1) || { echo "$OUT"; die "KV 创建失败"; }
   echo "$OUT"
@@ -73,14 +56,7 @@ else
   echo "wrangler.toml 里已有 KV id，跳过"
 fi
 
-step "4/7 建 R2 桶（存原件与译文）"
-if "$WRANGLER" r2 bucket create "$BUCKET" 2>&1 | tee /tmp/aurora-r2.log | grep -qi "already exists"; then
-  echo "桶已存在，跳过"
-else
-  tail -3 /tmp/aurora-r2.log
-fi
-
-step "5/7 写三个密钥"
+step "3/5 写三个密钥"
 # 内部密钥：网页端与 GitHub Actions 之间用，自动生成
 if [ ! -f "$SECRETS/agent_key" ]; then
   openssl rand -hex 24 > "$SECRETS/agent_key"
@@ -110,14 +86,14 @@ printf '%s' "$AGENT_KEY"  | "$WRANGLER" secret put AGENT_KEY >/dev/null
 printf '%s' "$GH_TOKEN_VALUE" | "$WRANGLER" secret put GH_TOKEN >/dev/null
 echo "PASSWORD / AGENT_KEY / GH_TOKEN 已写入 ✓"
 
-step "6/7 部署 Worker"
+step "4/5 部署 Worker"
 DEPLOY_LOG=$(cd "$HERE" && "$WRANGLER" deploy 2>&1)
 printf '%s\n' "$DEPLOY_LOG" | tail -6
 URL=$(printf '%s' "$DEPLOY_LOG" | grep -oE 'https://[a-z0-9.-]+\.workers\.dev' | head -1)
 [ -n "$URL" ] || die "没能从部署输出里认出网址，请手动看一眼上面的输出"
 echo "网址：$URL"
 
-step "7/7 把网址与内部密钥同步给 GitHub Actions"
+step "5/5 把网址与内部密钥同步给 GitHub Actions"
 gh variable set WORKER_URL --body "$URL" --repo "$(gh repo view --json nameWithOwner -q .nameWithOwner)" 2>/dev/null \
   || gh variable set WORKER_URL --body "$URL"
 printf '%s' "$AGENT_KEY" | gh secret set AGENT_KEY
@@ -135,6 +111,7 @@ cat <<EOF
 接下来：
   1. 浏览器打开上面的网址，输入口令，传一份 PDF 试一遍
   2. 想改口令：改 $SECRETS/password 后重跑本脚本
-  3. 想让朋友用：把网址和口令给他即可（译文 7 天后自动清理）
+  3. 想让朋友用：把网址和口令给他即可
+     （原件与译文 3 天后自动删除，任务记录保留 7 天；存储走 KV，不花钱）
 ──────────────────────────────────────────────
 EOF

@@ -1,5 +1,5 @@
 # aurora-translate 的 Cloudflare Worker 配置
-# 部署前需要把下面的占位符换成真实 id：见 cf/README.md 的"三、建资源"。
+# 部署前需要把下面的占位符换成真实 id：见 cf/README.md 的"部署"一节。
 
 name = "aurora-translate"
 main = "worker.js"
@@ -9,15 +9,17 @@ compatibility_date = "2025-01-01"
 [observability]
 enabled = true
 
-# 任务记录（谁在翻、翻到哪了、译文在哪）
+# 任务记录 + 文件分块（原件与译文都存这里，按 20MiB 切块）
 [[kv_namespaces]]
 binding = "JOBS"
 id = "REPLACE_WITH_KV_ID"
 
-# 原件与译文
-[[r2_buckets]]
-binding = "FILES"
-bucket_name = "aurora-files"
+# 走 KV 不需要绑银行卡。哪天你想升级成 R2（10GB 空间、文件更大），
+# 把下面三行的注释去掉、跑一次 wrangler deploy 就行 —— 代码会自动改用 R2，
+# 什么都不用改。注意 R2 需要在面板里先开通（要绑卡）。
+# [[r2_buckets]]
+# binding = "FILES"
+# bucket_name = "aurora-files"
 
 # 非密钥的配置放这里；密钥（PASSWORD / GH_TOKEN / AGENT_KEY）用 wrangler secret put 写
 [vars]
@@ -25,6 +27,6 @@ GH_REPO = "WANGAURORA27/aurora-translate"
 WORKFLOW = "translate.yml"
 GH_REF = "main"
 
-# 每天清一次超过 7 天的原件/译文
+# 每天清一次超过 7 天的对象（只有启用 R2 时才真的干活；KV 靠 TTL 自动过期）
 [triggers]
 crons = ["23 4 * * *"]

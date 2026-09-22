@@ -320,8 +320,17 @@ jobs:
           set -euo pipefail
           [ -n "$WORKER" ] || { echo "::error::仓库 Variable 里还没设置 WORKER_URL"; exit 1; }
           mkdir -p work
-          curl -fsSL --retry 3 --max-time 900 -D work/headers.txt \
-               -o work/_input -H "x-agent-key: $KEY" "$WORKER/api/input/$JOB"
+          # 云端存储是跨机房最终一致的（最长约 60 秒），刚传完可能还取不到 —— 重试几次
+          ok=0
+          for i in $(seq 1 10); do
+            if curl -fsSL --retry 2 --max-time 900 -D work/headers.txt \
+                 -o work/_input -H "x-agent-key: $KEY" "$WORKER/api/input/$JOB"; then
+              ok=1; break
+            fi
+            echo "第 $i 次取件没成功，等 12 秒再试…"
+            sleep 12
+          done
+          [ "$ok" = "1" ] || { echo "::error::取不到原件（云端还在同步，或 WORKER_URL / AGENT_KEY 不对）"; exit 1; }
           # 原文件名由 Worker 放在 x-filename 头里（URL 编码过，可能有中文）
           name=$(python3 - <<'PY'
           import urllib.parse

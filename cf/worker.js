@@ -3,26 +3,37 @@
  *
  * 它解决三件事：
  *   1. 密码门     —— 只有拿到口令的人能用，翻译的钱（你的 API key）不会被陌生人消耗
- *   2. 大文件     —— GitHub Issue 附件上限 25MB，这里用 R2 存原件和译文，能到 95MB
+ *   2. 大文件     —— GitHub Issue 附件上限 25MB，这里把原件和译文存进 Cloudflare，
+ *                    单个文件到 95MB，而且**不需要绑银行卡**
  *   3. 进度与下载 —— 页面实时看进度，译完直接点下载，不用去 GitHub 翻
  *
+ * 存储后端（自动选）：
+ *   * 没绑 R2  →  Workers KV 分块（免费额度 1GB 存储、每天 1000 次写、10 万次读，
+ *                 单值上限 25MiB，所以按 20MiB 切块；靠 TTL 自动过期，不花你的钱）
+ *   * 绑了 R2  →  直接用 R2（同一套接口，代码一行都不用改）
+ *
  * 文件流：
- *   浏览器 --PUT /api/upload--> R2(inputs/) --dispatch--> GitHub Actions
+ *   浏览器 --PUT /api/upload--> 存储层 --dispatch--> GitHub Actions
  *   Actions --GET /api/input/<id>--> 取原件
- *   Actions --POST /api/result/<id>--> 回传译文到 R2(results/)
- *   Actions --POST /api/status/<id>--> 回传进度/统计
+ *   Actions --POST /api/result/<id>--> 回传译文
+ *   Actions --POST /api/report/<id>--> 回传进度/统计
  *   浏览器 --GET /api/status?id=--> 看进度；--GET /api/download?id=--> 下载
  */
 
 import { PAGE } from "./page.js";
 
 const MAX_UPLOAD = 95 * 1024 * 1024; // Workers 免费版请求体上限 100MB，留点余量
-const JOB_TTL = 7 * 24 * 3600; // KV 记录保留 7 天，和 results 分支清理一致
-const JOB_RETENTION_MS = 7 * 24 * 3600 * 1000;
+const CHUNK = 20 * 1024 * 1024; // KV 单值上限 25MiB，切 20MiB 一块最稳
+const BLOB_TTL = 3 * 24 * 3600; // 原件与译文保留 3 天（KV 只有 1GB，靠 TTL 回收）
+const JOB_TTL = 7 * 24 * 3600; // 任务记录保留 7 天，历史里还能看到
+const DAILY_JOBS = 30; // 每天最多接这么多任务
+const DAILY_BYTES = 250 * 1024 * 1024; // 每天最多收这么多字节（3 天滚动也在 1GB 之内）
 const MODES = new Set(["inplace", "bilingual", "ocr"]);
 const TARGETS = new Set(["中文", "英文", "日文", "韩文", "法文", "德文", "西班牙文", "俄文"]);
 
 const MODE_LABEL = { inplace: "保持版式", bilingual: "中英对照", ocr: "扫描件 OCR" };
+
+const storeKind = (env) => (env.FILES ? "r2" : "kv");
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -40,10 +51,107 @@ function jobKey(id) {
 }
 
 function humanSize(bytes) {
-  if (!bytes) return "";
+  if (!bytes) return "0";
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
   return (bytes / 1024 / 1024).toFixed(1) + " MB";
 }
+
+// ── 存储层：对外只有 putBlob / readBlob / delBlob 三个动作 ────────────────
+// kind 取 "inputs" 或 "results"，一个任务各一份。
+
+/** 把一条流写进存储，返回 {count, size}；KV 走分块，R2 就是单个对象 */
+async function putBlob(env, id, kind, body) {
+  if (storeKind(env) === "r2") {
+    await env.FILES.put(kind + "/" + id + "/blob", body, {
+      httpMetadata: { contentType: "application/octet-stream" },
+    });
+    return { count: 1, size: null };
+  }
+
+  const reader = body.getReader();
+  let pieces = [];
+  let size = 0; // 当前累计（还没落盘）
+  let total = 0; // 整个文件
+  let index = 0;
+
+  const flush = async () => {
+    if (!size) return;
+    const chunk = new Uint8Array(size);
+    let off = 0;
+    for (const p of pieces) {
+      chunk.set(p, off);
+      off += p.length;
+    }
+    await env.JOBS.put("blob:" + kind + ":" + id + ":" + index, chunk, { expirationTtl: BLOB_TTL });
+    index += 1;
+    pieces = [];
+    size = 0;
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value || !value.length) continue;
+    total += value.length;
+    if (total > MAX_UPLOAD) {
+      await reader.cancel().catch(() => {});
+      await delBlob(env, id, kind, index + 1);
+      throw new Error("文件超过上限 " + humanSize(MAX_UPLOAD));
+    }
+    pieces.push(value);
+    size += value.length;
+    if (size >= CHUNK) await flush();
+  }
+  await flush();
+  return { count: index, size: total };
+}
+
+/** 读回一条流；count 是写入时得到的块数（R2 模式下忽略） */
+async function readBlob(env, id, kind, count) {
+  if (storeKind(env) === "r2") {
+    const head = await env.FILES.head(kind + "/" + id + "/blob");
+    if (!head) return null;
+    const obj = await env.FILES.get(kind + "/" + id + "/blob");
+    return { stream: obj.body, size: head.size };
+  }
+  if (!count) return null;
+  const prefix = "blob:" + kind + ":" + id + ":";
+  const first = await env.JOBS.get(prefix + "0", "arrayBuffer");
+  if (!first) return null;
+
+  let i = 1;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(first));
+    },
+    async pull(controller) {
+      if (i >= count) {
+        controller.close();
+        return;
+      }
+      const buf = await env.JOBS.get(prefix + i, "arrayBuffer");
+      i += 1;
+      if (!buf) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(new Uint8Array(buf));
+    },
+  });
+  return { stream, size: null };
+}
+
+async function delBlob(env, id, kind, count) {
+  if (storeKind(env) === "r2") {
+    await env.FILES.delete(kind + "/" + id + "/blob").catch(() => {});
+    return;
+  }
+  for (let i = 0; i < Math.max(count, 1); i += 1) {
+    await env.JOBS.delete("blob:" + kind + ":" + id + ":" + i).catch(() => {});
+  }
+}
+
+// ── 任务记录 ──────────────────────────────────────────────────────────
 
 async function readJob(env, id) {
   return env.JOBS.get(jobKey(id), "json");
@@ -53,6 +161,31 @@ async function saveJob(env, job) {
   await env.JOBS.put(jobKey(job.id), JSON.stringify(job), { expirationTtl: JOB_TTL });
   return job;
 }
+
+/** 每日配额：免费额度是 1GB 存储，用这个挡住"口令泄露后被人灌爆" */
+async function quotaToday(env) {
+  const day = new Date().toISOString().slice(0, 10);
+  const rec = (await env.JOBS.get("quota:" + day, "json")) || { jobs: 0, bytes: 0 };
+  return { day, rec };
+}
+
+async function quotaCheck(env, bytes) {
+  const { rec } = await quotaToday(env);
+  if (rec.jobs >= DAILY_JOBS) return "今天任务已排满（上限 " + DAILY_JOBS + " 个），明天再来";
+  if (rec.bytes + bytes > DAILY_BYTES) {
+    return "今天上传总量已到上限（" + humanSize(DAILY_BYTES) + "），明天再来";
+  }
+  return null;
+}
+
+async function quotaAdd(env, bytes) {
+  const { day, rec } = await quotaToday(env);
+  rec.jobs += 1;
+  rec.bytes += bytes;
+  await env.JOBS.put("quota:" + day, JSON.stringify(rec), { expirationTtl: 3 * 24 * 3600 });
+}
+
+// ── GitHub ───────────────────────────────────────────────────────────
 
 async function ghFetch(env, path, init = {}) {
   const headers = {
@@ -78,10 +211,19 @@ async function refreshFromGitHub(env, job) {
       const run = await resp.json();
       if (run.status === "completed") {
         if (run.conclusion === "success") {
-          // 成功但没收到译文回传，多半是回传那一步挂了
+          // 这一步的关键：KV 是**跨机房最终一致**的（最长约 60 秒），
+          // Actions 把译文写进 KV 的那个机房，和这个用户请求落到的机房可能不是同一个。
+          // 所以"运行成功但本机房还没看到译文"不能立刻判失败，否则会把好任务写成失败。
+          // 给 2 分钟同步时间，超了才当真失败。
           if (job.status !== "done") {
-            job.status = "failed";
-            job.note = "任务已结束，但没收到译文，请去 GitHub 看这次运行日志";
+            const finished = Date.parse(run.updated_at || "") || Date.now();
+            if (Date.now() - finished > 120000) {
+              job.status = "failed";
+              job.note = "任务已结束，但没收到译文，请去 GitHub 看这次运行日志";
+            } else {
+              job.status = "running";
+              job.note = "翻译已完成，译文正在同步，稍等一下…";
+            }
           }
         } else if (run.conclusion === "cancelled") {
           job.status = "failed";
@@ -106,7 +248,10 @@ async function refreshFromGitHub(env, job) {
 async function adoptRun(env, jobId) {
   for (let attempt = 0; attempt < 6; attempt++) {
     await new Promise((r) => setTimeout(r, 1500));
-    const resp = await ghFetch(env, "/actions/workflows/" + (env.WORKFLOW || "translate.yml") + "/runs?event=workflow_dispatch&per_page=10");
+    const resp = await ghFetch(
+      env,
+      "/actions/workflows/" + (env.WORKFLOW || "translate.yml") + "/runs?event=workflow_dispatch&per_page=10",
+    );
     if (!resp.ok) return;
     const data = await resp.json();
     const run = (data.workflow_runs || []).find((r) => (r.display_title || "").includes(jobId));
@@ -120,6 +265,8 @@ async function adoptRun(env, jobId) {
   }
 }
 
+// ── 鉴权 ─────────────────────────────────────────────────────────────
+
 function authorizeUser(request, env, url) {
   const given = request.headers.get("x-password") || url.searchParams.get("password") || "";
   if (!env.PASSWORD) return "服务端还没设置口令（PASSWORD）";
@@ -132,6 +279,8 @@ function authorizeAgent(request, env) {
   if (request.headers.get("x-agent-key") !== env.AGENT_KEY) return "内部密钥不对";
   return null;
 }
+
+// ── 接口 ─────────────────────────────────────────────────────────────
 
 async function handleUpload(request, env, ctx) {
   const daren = authorizeUser(request, env, new URL(request.url));
@@ -155,28 +304,43 @@ async function handleUpload(request, env, ctx) {
   }
   if (!request.body) return fail("没收到文件内容");
 
+  const quotaErr = await quotaCheck(env, declared);
+  if (quotaErr) return fail(quotaErr, 429);
+
   const id = crypto.randomUUID().replace(/-/g, "").slice(0, 20);
-  const key = "inputs/" + id + "/" + name;
-  await env.FILES.put(key, request.body, { httpMetadata: { contentType: "application/octet-stream" } });
+  let written;
+  try {
+    written = await putBlob(env, id, "inputs", request.body);
+  } catch (err) {
+    return fail("保存文件失败：" + (err && err.message ? err.message : String(err)), 500);
+  }
+  const size = written.size || declared;
+  await quotaAdd(env, size);
 
   const job = {
     id,
     name,
     mode,
     target,
-    size: declared,
+    size,
     status: "queued",
     note: "已收到，正在排队",
     createdAt: Date.now(),
-    inputKey: key,
+    backend: storeKind(env),
+    inputChunks: written.count,
+    inputSize: size,
     source: "cloud",
   };
   await saveJob(env, job);
 
-  const resp = await ghFetch(env, "/actions/workflows/" + (env.WORKFLOW || "translate.yml") + "/dispatches", {
-    method: "POST",
-    body: JSON.stringify({ ref: env.GH_REF || "main", inputs: { job_id: id, mode, target } }),
-  });
+  const resp = await ghFetch(
+    env,
+    "/actions/workflows/" + (env.WORKFLOW || "translate.yml") + "/dispatches",
+    {
+      method: "POST",
+      body: JSON.stringify({ ref: env.GH_REF || "main", inputs: { job_id: id, mode, target } }),
+    },
+  );
   if (!resp.ok) {
     const text = await resp.text();
     job.status = "failed";
@@ -219,21 +383,21 @@ async function handleDownload(request, env, url) {
   const id = url.searchParams.get("id");
   const job = await readJob(env, id);
   if (!job) return fail("没有这个任务", 404);
-  if (!job.resultKey) return fail("译文还没好", 409);
+  if (!job.resultChunks) return fail("译文还没好", 409);
 
-  const head = await env.FILES.head(job.resultKey);
-  if (!head) return fail("译文已过期（保留 7 天）", 410);
-  const obj = await env.FILES.get(job.resultKey);
+  const blob = await readBlob(env, id, "results", job.resultChunks);
+  if (!blob) return fail("译文已过期（原件与译文只保留 3 天）", 410);
   const filename = job.resultName || "translated.pdf";
-  return new Response(obj.body, {
-    headers: {
-      "content-type": "application/octet-stream",
-      "content-length": String(head.size),
-      "content-disposition":
-        "attachment; filename=\"translated" + (filename.match(/\.[a-z0-9]+$/i) || [".pdf"])[0] + "\"; filename*=UTF-8''" + encodeURIComponent(filename),
-      "cache-control": "no-store",
-    },
-  });
+  const ext = (filename.match(/\.[a-z0-9]+$/i) || [".pdf"])[0];
+  const headers = {
+    "content-type": "application/octet-stream",
+    "content-disposition":
+      'attachment; filename="translated' + ext + "\"; filename*=UTF-8''" + encodeURIComponent(filename),
+    "cache-control": "no-store",
+  };
+  const size = blob.size || job.resultSize;
+  if (size) headers["content-length"] = String(size);
+  return new Response(blob.stream, { headers });
 }
 
 async function handleInput(request, env) {
@@ -242,9 +406,9 @@ async function handleInput(request, env) {
   const id = new URL(request.url).pathname.split("/").pop();
   const job = await readJob(env, id);
   if (!job) return fail("没有这个任务", 404);
-  const obj = await env.FILES.get(job.inputKey);
-  if (!obj) return fail("原件不见了", 404);
-  return new Response(obj.body, {
+  const blob = await readBlob(env, id, "inputs", job.inputChunks);
+  if (!blob) return fail("原件不见了", 404);
+  return new Response(blob.stream, {
     headers: {
       "content-type": "application/octet-stream",
       "x-filename": encodeURIComponent(job.name),
@@ -260,13 +424,19 @@ async function handleResult(request, env) {
   const id = new URL(request.url).pathname.split("/").pop();
   const job = await readJob(env, id);
   if (!job) return fail("没有这个任务", 404);
+  if (!request.body) return fail("没收到译文内容");
 
   const resultName = decodeURIComponent(request.headers.get("x-filename") || job.name);
-  const key = "results/" + id + "/" + resultName;
-  await env.FILES.put(key, request.body, { httpMetadata: { contentType: "application/octet-stream" } });
+  let written;
+  try {
+    written = await putBlob(env, id, "results", request.body);
+  } catch (err) {
+    return fail("保存译文失败：" + (err && err.message ? err.message : String(err)), 500);
+  }
 
-  job.resultKey = key;
   job.resultName = resultName;
+  job.resultChunks = written.count;
+  job.resultSize = written.size || Number(request.headers.get("content-length") || 0);
   job.status = "done";
   job.note = "翻译完成";
   job.doneAt = Date.now();
@@ -281,7 +451,9 @@ async function handleReport(request, env) {
   const job = await readJob(env, id);
   if (!job) return fail("没有这个任务", 404);
   const body = await request.json().catch(() => ({}));
-  if (body.status && ["queued", "running", "done", "failed"].includes(body.status)) job.status = body.status;
+  if (body.status && ["queued", "running", "done", "failed"].includes(body.status)) {
+    job.status = body.status;
+  }
   if (body.note) job.note = String(body.note).slice(0, 500);
   if (body.stats) job.stats = body.stats;
   await saveJob(env, job);
@@ -291,15 +463,20 @@ async function handleReport(request, env) {
 async function handleHistory(request, env, url) {
   const daren = authorizeUser(request, env, url);
   if (daren) return fail(daren, 401);
-  const list = await env.JOBS.list({ prefix: "job:", limit: 60 });
+  const list = await env.JOBS.list({ prefix: "job:", limit: 100 });
   const jobs = [];
   for (const key of list.keys) {
     const job = await env.JOBS.get(key.name, "json");
     if (!job) continue;
     jobs.push({
-      id: job.id, name: job.name, modeLabel: MODE_LABEL[job.mode] || job.mode,
-      status: job.status, note: job.note || "", createdAt: job.createdAt,
-      ready: job.status === "done", target: job.target,
+      id: job.id,
+      name: job.name,
+      modeLabel: MODE_LABEL[job.mode] || job.mode,
+      status: job.status,
+      note: job.note || "",
+      createdAt: job.createdAt,
+      ready: job.status === "done",
+      target: job.target,
     });
   }
   jobs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
@@ -331,9 +508,13 @@ export default {
     }
   },
 
-  /** 每天清一次 R2 里超过 7 天的原件和译文，别让存储无限长大 */
+  /**
+   * 每天一次：走 KV 时什么都不用做（expirationTtl 会自动清）；
+   * 以后要是绑了 R2，就用它删掉超过 7 天的对象。
+   */
   async scheduled(event, env, ctx) {
-    const cutoff = Date.now() - JOB_RETENTION_MS;
+    if (!env.FILES) return;
+    const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
     for (const prefix of ["inputs/", "results/"]) {
       let cursor;
       do {
