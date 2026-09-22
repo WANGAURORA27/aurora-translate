@@ -82,19 +82,26 @@ jobs:
               m = re.search(r"###\s*%s\s*\n+(.*?)(?=\n###|\Z)" % re.escape(name), body, re.S)
               return (m.group(1).strip() if m else "")
 
-          # GitHub 把附件渲染成 [原文件名.pdf](附件URL)，链接文字就是书名 —— 用它给产物命名
+          # 按优先级找文件链接：
+          #   1) markdown 链接 [书名.pdf](URL) —— 拖拽上传就是这样，链接文字就是原文件名
+          #   2) 任何以 .pdf/.docx 结尾的链接（用户可以贴自己的下载地址）
+          #   3) GitHub 附件的裸链接（没有扩展名的那种）
           md = re.search(r"\[([^\]\n]{1,160}?\.(?:pdf|docx))\]"
-                         r"\((https://github\.com/user-attachments/assets/[^)\s]+)\)",
-                         body, re.I)
+                         r"\((https?://[^)\s]+)\)", body, re.I)
+          any_file = re.findall(r"https?://[^\s\)\]]+\.(?:pdf|docx)(?:\?[^\s\)\]]*)?",
+                                body, re.I)
+          attach = re.findall(r"https://(?:github\.com/user-attachments/assets/[\w.-]+"
+                              r"|user-images\.githubusercontent\.com/[\w./%-]+)", body)
+
           name_hint = ""
+          urls: list[str] = []
           if md:
               name_hint = md.group(1).strip()
-              urls.insert(0, md.group(2))
+              urls.append(md.group(2))
+          for u in list(any_file) + list(attach):
+              if u not in urls:
+                  urls.append(u)
 
-          pattern = (r"https://(?:github\.com/user-attachments/assets/[\w.-]+"
-                     r"|user-images\.githubusercontent\.com/[\w./%-]+"
-                     r"|github\.com/[\w.-]+/[\w.-]+/files/\d+/[\w.-]+)")
-          urls = re.findall(pattern, body)
           if manual:
               urls.insert(0, manual.strip())
 
