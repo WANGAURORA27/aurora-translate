@@ -241,12 +241,15 @@ jobs:
           RAW: ${{ steps.publish.outputs.raw }}
         run: |
           [ -n "$ISSUE" ] || exit 0
+          # 文件名里可能有空格或中文，直接把 URL 写进正文会点不开 —— 用 markdown 链接 + URL 编码
+          LINK=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=':/'))" "$RAW")
+          NAME=$(basename "$RAW")
           gh issue comment "$ISSUE" --body "✅ **翻译完成**
 
-          **直接下载**：$RAW
-          （公开仓库无需登录；链接来自 \`results\` 分支，7 天后会被定时任务清理）
+          **[⬇ 下载 $NAME]($LINK)**
 
-          工作流运行记录（含完整日志与统计）：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          链接来自 \`results\` 分支，公开仓库无需登录，**7 天后自动清理**。
+          运行记录（含完整日志与统计）：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           gh issue edit "$ISSUE" --add-label "已完成" 2>/dev/null || true
           gh issue close "$ISSUE"
 
