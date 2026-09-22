@@ -1,0 +1,30 @@
+# aurora-translate 的 Cloudflare Worker 配置
+# 部署前需要把下面的占位符换成真实 id：见 cf/README.md 的"三、建资源"。
+
+name = "aurora-translate"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# 日志可以在 Cloudflare 面板的 Workers Logs 里看，排查问题用
+[observability]
+enabled = true
+
+# 任务记录（谁在翻、翻到哪了、译文在哪）
+[[kv_namespaces]]
+binding = "JOBS"
+id = "REPLACE_WITH_KV_ID"
+
+# 原件与译文
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "aurora-files"
+
+# 非密钥的配置放这里；密钥（PASSWORD / GH_TOKEN / AGENT_KEY）用 wrangler secret put 写
+[vars]
+GH_REPO = "WANGAURORA27/aurora-translate"
+WORKFLOW = "translate.yml"
+GH_REF = "main"
+
+# 每天清一次超过 7 天的原件/译文
+[triggers]
+crons = ["23 4 * * *"]

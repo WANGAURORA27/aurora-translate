@@ -1,27 +1,45 @@
 name: 文档翻译
 
+# 网页端（Cloudflare Worker）派下来的任务带 job_id，把它写进运行标题，
+# Worker 就能在运行列表里认领"这次是我派的那个任务"，进而在页面上显示进度。
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && inputs.job_id != ''
+  && format('云端任务 {0}', inputs.job_id)
+  || (github.event.issue.number && format('Issue #{0}', github.event.issue.number))
+  || '手动运行' }}
+
 # 怎么用：在仓库里新建 Issue（选「📄 翻译文档」模板）→ 把文件拖进去 → 等机器人回复下载链接。
 # 只有仓库所有者与协作者（Collaborator）能触发；其他人提交会被机器人礼貌拒绝。
+# 网页端（cf/ 里那个 Worker）走的是下面 cloud 这个 job：文件存 R2，不落 git。
 #
 # 需要的仓库 Secret：
 #   PROFILES_JSON  ← 你的 profiles.json 全文（含 API 密钥），见 README 的配置说明
+#   AGENT_KEY      ← 网页端与这里约定的内部密钥（和 Worker 上的一致）
+# 需要的仓库 Variable：
+#   WORKER_URL     ← 网页端的地址，例如 https://aurora-translate.xxx.workers.dev
 # 可选：
 #   DEFAULT_PROFILE  指定默认用哪个通道代号（不设则用 profiles 里第一个可用的）
 
 on:
   issues:
     types: [opened, edited]
-  workflow_dispatch:            # 手动跑（自己调试用）
+  workflow_dispatch:            # 手动跑（自己调试用），或被网页端调用
     inputs:
       file_url:
         description: 文件直链（GitHub 附件链接或任何可公开下载的 URL）
-        required: true
+        required: false
+      job_id:
+        description: 云端任务编号（由网页端自动填入，正常不用手填）
+        required: false
       mode:
         description: 输出形式
         required: false
         default: inplace
         type: choice
         options: [inplace, bilingual, ocr]
+      target:
+        description: 目标语言（云端任务用；留空按简体中文）
+        required: false
 
 permissions:
   contents: write               # 把译文推到 results 分支
@@ -34,10 +52,12 @@ concurrency:
 
 jobs:
   translate:
-    # 只处理带 translate 标签的 Issue（Issue 模板会自动打上这个标签）
+    # 只处理带 translate 标签的 Issue（Issue 模板会自动打上这个标签）；
+    # 网页端派下来的任务（带 job_id）走下面的 cloud，不在这里重复跑一遍。
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      contains(github.event.issue.labels.*.name, 'translate')
+      (github.event_name == 'issues' &&
+       contains(github.event.issue.labels.*.name, 'translate')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.job_id == '')
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -262,3 +282,137 @@ jobs:
           [ -n "$ISSUE" ] || exit 0
           gh issue comment "$ISSUE" --body "❌ 翻译失败。请点上面的运行记录查看日志；
           常见原因：文件加密/损坏、超过 25MB、密钥额度不足、或这份 PDF 需要改用「扫描版 OCR」模式。"
+
+  # ── 网页端派下来的任务 ─────────────────────────────────────────────────
+  # 与上面那条路互不干扰：原件从 Worker 取、译文回传给 Worker，都不落 git，
+  # 所以不受 Issue 附件 25MB 的限制（上限由 Worker 那边把关）。
+  cloud:
+    if: github.event_name == 'workflow_dispatch' && inputs.job_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
+               fonts-arphic-uming fonts-dejavu-core
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q -r requirements.txt
+
+      - name: 从网页端取原件
+        id: fetch
+        env:
+          WORKER: ${{ vars.WORKER_URL }}
+          KEY: ${{ secrets.AGENT_KEY }}
+          JOB: ${{ inputs.job_id }}
+        run: |
+          set -euo pipefail
+          [ -n "$WORKER" ] || { echo "::error::仓库 Variable 里还没设置 WORKER_URL"; exit 1; }
+          mkdir -p work
+          curl -fsSL --retry 3 --max-time 900 -D work/headers.txt \
+               -o work/_input -H "x-agent-key: $KEY" "$WORKER/api/input/$JOB"
+          # 原文件名由 Worker 放在 x-filename 头里（URL 编码过，可能有中文）
+          name=$(python3 - <<'PY'
+          import urllib.parse
+          for line in open("work/headers.txt", encoding="utf-8", errors="ignore"):
+              if line.lower().startswith("x-filename:"):
+                  print(urllib.parse.unquote(line.split(":", 1)[1].strip()))
+                  break
+          else:
+              print("input.pdf")
+          PY
+          )
+          mv work/_input "work/$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "大小 $(du -h "work/$name" | cut -f1)"
+
+      - name: 回报"开始翻译"
+        env:
+          WORKER: ${{ vars.WORKER_URL }}
+          KEY: ${{ secrets.AGENT_KEY }}
+          JOB: ${{ inputs.job_id }}
+        run: |
+          curl -fsS -X POST "$WORKER/api/report/$JOB" -H "x-agent-key: $KEY" \
+            -H 'content-type: application/json' \
+            -d '{"status":"running","note":"正在翻译，这个页面每几秒自动刷新"}' || true
+
+      - name: 翻译
+        id: run
+        env:
+          DOCBRIDGE_PROFILES_JSON: ${{ secrets.PROFILES_JSON }}
+          DOCBRIDGE_STATS_OUT: work/stats.json
+          DEFAULT_PROFILE: ${{ vars.DEFAULT_PROFILE }}
+          MODE: ${{ inputs.mode }}
+          TARGET: ${{ inputs.target }}
+          NAME: ${{ steps.fetch.outputs.name }}
+        run: |
+          set -euo pipefail
+          case "${TARGET:-}" in
+            英文) t=en ;; 日文) t=ja ;; 韩文) t=ko ;; 法文) t=fr ;;
+            德文) t=de ;; 西班牙文) t=es ;; 俄文) t=ru ;;
+            "") t=zh-Hans ;; *) t="$TARGET" ;;
+          esac
+          # `${NAME##*.}` 不含点号，别漏了
+          stem="${NAME%.*}"
+          ext="${NAME##*.}"
+          out="work/${stem}_${MODE}.${ext}"
+          python3 tools/translate_cli.py \
+            --input "work/$NAME" --output "$out" \
+            --mode "$MODE" --target "$t" \
+            --profile "${DEFAULT_PROFILE:-}" \
+            --options '{"prefetch": true, "shared_cache": false}'
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+          echo "### 统计" >> "$GITHUB_STEP_SUMMARY"
+          cat work/stats.json >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: 回传译文
+        if: success()
+        env:
+          WORKER: ${{ vars.WORKER_URL }}
+          KEY: ${{ secrets.AGENT_KEY }}
+          JOB: ${{ inputs.job_id }}
+          OUT: ${{ steps.run.outputs.out }}
+        run: |
+          set -euo pipefail
+          base=$(basename "$OUT")
+          encoded=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$base")
+          curl -fsS --retry 3 --max-time 1800 -X POST "$WORKER/api/result/$JOB" \
+            -H "x-agent-key: $KEY" -H "x-filename: $encoded" \
+            -H 'content-type: application/octet-stream' \
+            --data-binary @"$OUT"
+          echo "已回传 $base（$(du -h "$OUT" | cut -f1)）"
+
+      - name: 回传统计
+        if: success()
+        env:
+          WORKER: ${{ vars.WORKER_URL }}
+          KEY: ${{ secrets.AGENT_KEY }}
+          JOB: ${{ inputs.job_id }}
+        run: |
+          [ -f work/stats.json ] || echo '{}' > work/stats.json
+          body=$(python3 -c 'import json,sys; print(json.dumps({"status":"done","note":"翻译完成","stats":json.load(open("work/stats.json"))}))')
+          curl -fsS -X POST "$WORKER/api/report/$JOB" -H "x-agent-key: $KEY" \
+            -H 'content-type: application/json' -d "$body" || true
+
+      - name: 失败时告诉页面原因
+        if: failure()
+        env:
+          WORKER: ${{ vars.WORKER_URL }}
+          KEY: ${{ secrets.AGENT_KEY }}
+          JOB: ${{ inputs.job_id }}
+        run: |
+          note="翻译失败：文件加密/损坏、语言不支持、额度用尽，或这份 PDF 需要改用「扫描版 OCR」。点日志链接看详细原因"
+          curl -fsS -X POST "$WORKER/api/report/$JOB" -H "x-agent-key: $KEY" \
+            -H 'content-type: application/json' \
+            -d "$(python3 -c 'import json,sys; print(json.dumps({"status":"failed","note":sys.argv[1]}))' "$note")" || true

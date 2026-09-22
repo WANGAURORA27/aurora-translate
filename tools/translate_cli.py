@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -145,6 +146,7 @@ def main() -> int:
             print("  [进度] " + line, flush=True)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+    started = time.time()
     try:
         result = module.run(args.input, args.output, translate=tr,
                             progress=progress, options=options)
@@ -177,6 +179,22 @@ def main() -> int:
                       "api_tokens_in", "api_tokens_out"):
                 if stats.get(k) is not None:
                     fh.write("| %s | %s |\n" % (k, stats[k]))
+
+    # 机器可读统计：Actions 里用它把进度/页数回传给网页端
+    stats_path = os.environ.get("DOCBRIDGE_STATS_OUT")
+    if stats_path:
+        keys = ("units", "pages", "skipped", "lines", "batches", "reused",
+                "chars_in", "chars_out", "api_calls", "api_tokens_in",
+                "api_tokens_out", "cached_lines")
+        payload = {k: stats[k] for k in keys if stats.get(k) is not None}
+        payload["seconds"] = round(time.time() - started, 1)
+        payload["outputMB"] = round(size / 1048576, 2)
+        payload["mode"] = args.mode
+        try:
+            with open(stats_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+        except OSError as exc:
+            print("[warn] 统计写入失败：%s" % exc, file=sys.stderr)
     if profiles_path and profiles_path.startswith(tempfile.gettempdir()):
         try:
             os.unlink(profiles_path)                     # 用完即焚
