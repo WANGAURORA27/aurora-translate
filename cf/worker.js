@@ -224,51 +224,34 @@ function phaseFor(stepName) {
   return stepName;
 }
 
-/** 问 GitHub 这个 run 到哪一步了，只在距离上次查超过 8 秒时才真去问（省调用次数） */
-async function refreshFromGitHub(env, job) {
-  if (!job.runId) return job;
-  if (job.status === "done" || job.status === "failed") return job;
-  if (Date.now() - (job.checkedAt || 0) < 8000) return job;
+/**
+ * GitHub 上这次运行的"事实"，带 8 秒内存缓存（只在当前实例里，best-effort）。
+ *
+ * ★ 为什么坚决不写回 KV：KV 是跨机房最终一致的。曾经这里是"读记录→改→写回"，
+ *   结果一个还没同步到"完成"的机房把旧状态写回去，**覆盖掉了 Actions 已经写好的
+ *   resultChunks，好任务被标成失败**，而且它反复续命、永远收敛不了。
+ *   所以：派生状态一律只用于本次响应，绝不落库；KV 里只保留 Actions 明确上报的状态。
+ */
+const RUN_CACHE = new Map();
+const RUN_TTL = 8000;
 
-  job.checkedAt = Date.now();
+async function runFacts(env, runId) {
+  const hit = RUN_CACHE.get(runId);
+  if (hit && Date.now() - hit.at < RUN_TTL) return hit;
+
+  const facts = {
+    at: Date.now(), status: "", conclusion: "", phase: "", stepIndex: 0, stepTotal: 0, url: "",
+  };
   try {
-    const resp = await ghFetch(env, "/actions/runs/" + job.runId);
+    const resp = await ghFetch(env, "/actions/runs/" + runId);
     if (resp.ok) {
       const run = await resp.json();
-      if (run.status === "completed") {
-        if (run.conclusion === "success") {
-          // 这一步的关键：KV 是**跨机房最终一致**的（最长约 60 秒），
-          // Actions 把译文写进 KV 的那个机房，和这个用户请求落到的机房可能不是同一个。
-          // 所以"运行成功但本机房还没看到译文"不能立刻判失败，否则会把好任务写成失败。
-          // 给 2 分钟同步时间，超了才当真失败。
-          if (job.status !== "done") {
-            const finished = Date.parse(run.updated_at || "") || Date.now();
-            if (Date.now() - finished > 120000) {
-              job.status = "failed";
-              job.note = "任务已结束，但没收到译文，请去 GitHub 看这次运行日志";
-            } else {
-              job.status = "running";
-              job.note = "翻译已完成，译文正在同步，稍等一下…";
-            }
-          }
-        } else if (run.conclusion === "cancelled") {
-          job.status = "failed";
-          job.note = "任务被取消";
-        } else {
-          job.status = "failed";
-          job.note = "翻译失败（" + run.conclusion + "），常见原因：文件加密、语言不支持、额度用尽";
-        }
-      } else if (run.status === "in_progress") {
-        job.status = "running";
-      } else {
-        job.status = "queued";
-      }
+      facts.status = run.status || "";
+      facts.conclusion = run.conclusion || "";
+      facts.url = run.html_url || "";
     }
-
-    // 再看一眼"具体跑到哪一步了"：把 Actions 里正在执行的那一步翻译成人话，
-    // 顺便给出 第几步/共几步，页面上的进度条就能真的动起来。
-    if (job.status === "running" || job.status === "queued") {
-      const jobsResp = await ghFetch(env, "/actions/runs/" + job.runId + "/jobs");
+    if (facts.status !== "completed") {
+      const jobsResp = await ghFetch(env, "/actions/runs/" + runId + "/jobs");
       if (jobsResp.ok) {
         const data = await jobsResp.json();
         const list = data.jobs || [];
@@ -277,17 +260,34 @@ async function refreshFromGitHub(env, job) {
           const steps = target.steps || [];
           const running = steps.findIndex((s) => s.status === "in_progress");
           const doneCount = steps.filter((s) => s.status === "completed").length;
-          job.stepTotal = steps.length;
-          job.stepIndex = running >= 0 ? running + 1 : Math.max(doneCount, 1);
-          if (running >= 0) job.phase = phaseFor(steps[running].name);
-          else if (target.status === "queued") job.phase = "已排队，等 GitHub 分配机器…";
+          facts.stepTotal = steps.length;
+          facts.stepIndex = running >= 0 ? running + 1 : Math.max(doneCount, 1);
+          if (running >= 0) facts.phase = phaseFor(steps[running].name);
+          else if (target.status === "queued") facts.phase = "已排队，等 GitHub 分配机器…";
         }
       }
     }
   } catch (err) {
-    // 查进度失败不影响主流程，页面下次再问
+    // 查不到就用记录里的状态，不影响主流程
   }
-  return saveJob(env, job);
+  if (RUN_CACHE.size > 50) RUN_CACHE.clear();   // 实例长活时别无限长大
+  RUN_CACHE.set(runId, facts);
+  return facts;
+}
+
+/** 译文块到底在不在（记录可能被搞乱，但数据不会骗人）——用于自愈与下载兜底 */
+async function resultChunkCount(env, id) {
+  if (storeKind(env) === "r2") {
+    const head = await env.FILES.head("results/" + id + "/blob");
+    return head ? 1 : 0;
+  }
+  let n = 0;
+  for (let i = 0; i < 40; i += 1) {
+    const buf = await env.JOBS.get("blob:results:" + id + ":" + i, "arrayBuffer");
+    if (!buf) break;
+    n = i + 1;
+  }
+  return n;
 }
 
 /** workflow_dispatch 不返回 run id，用 run-name 里带的 job_id 去列表里认领 */
@@ -399,6 +399,28 @@ async function handleUpload(request, env, ctx) {
   return json({ ok: true, id, name, mode, target, status: job.status });
 }
 
+/** 记录说没完成、但译文块确实在 → 以数据为准，把记录修好（幂等，只升不降） */
+async function healJob(env, job) {
+  if (job.status === "done") return job;
+  const chunks = await resultChunkCount(env, job.id);
+  if (!chunks) return job;
+  job.status = "done";
+  job.resultChunks = chunks;
+  job.resultName = job.resultName || defaultResultName(job);
+  job.note = "翻译完成";
+  job.doneAt = job.doneAt || Date.now();
+  return saveJob(env, job);
+}
+
+/** 记录没坏时的正常命名：<原名>_<模式>.<扩展名>（和命令行一致） */
+function defaultResultName(job) {
+  const name = job.name || "input.pdf";
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : ".pdf";
+  return stem + "_" + (job.mode || "inplace") + ext;
+}
+
 async function handleStatus(request, env, url) {
   const daren = authorizeUser(request, env, url);
   if (daren) return fail(daren, 401);
@@ -406,13 +428,41 @@ async function handleStatus(request, env, url) {
   if (!id) return fail("缺少 id");
   let job = await readJob(env, id);
   if (!job) return fail("没有这个任务（记录保留 7 天）", 404);
-  job = await refreshFromGitHub(env, job);
-  const queued = job.status === "queued";
-  const phase = job.status === "done"
-    ? "翻译完成"
-    : job.status === "failed"
-      ? (job.note || "翻译失败")
-      : job.phase || (queued ? "已排队，马上开始…" : "正在翻译…");
+  job = await healJob(env, job);
+
+  // 以下都是"派生状态"：只用于这次响应，**不写回 KV**（写回会覆盖 Actions 的真实上报）
+  let status = job.status;
+  let phase = "";
+  let note = job.note || "";
+  let stepIndex = 0;
+  let stepTotal = 0;
+  let runUrl = job.runUrl || "";
+
+  if (job.runId && status !== "done") {
+    const facts = await runFacts(env, job.runId);
+    if (facts.url) runUrl = facts.url;
+    if (facts.status === "completed") {
+      if (facts.conclusion === "success") {
+        status = "running";
+        phase = "翻译已完成，译文正在同步（约 1 分钟）…";
+      } else if (status !== "failed") {
+        status = "failed";
+        phase = facts.conclusion === "cancelled" ? "任务被取消" : "翻译失败";
+        note = facts.conclusion === "cancelled"
+          ? "任务被取消"
+          : "翻译失败（" + facts.conclusion + "），常见原因：文件加密、语言不支持、额度用尽";
+      }
+    } else {
+      status = facts.status === "in_progress" ? "running" : "queued";
+      phase = facts.phase || (status === "queued" ? "已排队，马上开始…" : "正在翻译…");
+      stepIndex = facts.stepIndex;
+      stepTotal = facts.stepTotal;
+    }
+  }
+  if (status === "done") phase = "翻译完成";
+  else if (status === "failed") phase = phase || note || "翻译失败";
+  else if (!phase) phase = status === "queued" ? "已排队，马上开始…" : "正在翻译…";
+
   return json({
     ok: true,
     id: job.id,
@@ -421,16 +471,16 @@ async function handleStatus(request, env, url) {
     modeLabel: MODE_LABEL[job.mode] || job.mode,
     target: job.target,
     size: job.size,
-    status: job.status,
+    status,
     // phase 是"给人看的当前阶段"，note 是更细的说明
     phase,
-    note: job.note || "",
-    stepIndex: job.stepIndex || 0,
-    stepTotal: job.stepTotal || 0,
+    note,
+    stepIndex,
+    stepTotal,
     // 从提交到现在过了多久（页面自己再往上加秒数，避免频繁请求）
     elapsedSec: Math.max(0, Math.round((Date.now() - (job.createdAt || Date.now())) / 1000)),
-    runUrl: job.runUrl || "",
-    ready: job.status === "done",
+    runUrl,
+    ready: status === "done",
     stats: job.stats || null,
   });
 }
@@ -439,8 +489,10 @@ async function handleDownload(request, env, url) {
   const daren = authorizeUser(request, env, url);
   if (daren) return fail(daren, 401);
   const id = url.searchParams.get("id");
-  const job = await readJob(env, id);
+  let job = await readJob(env, id);
   if (!job) return fail("没有这个任务", 404);
+  // 记录说没完成也不算数：先去存储里看译文块在不在（跨机房延迟会把记录写乱）
+  job = await healJob(env, job);
   if (!job.resultChunks) return fail("译文还没好", 409);
 
   const blob = await readBlob(env, id, "results", job.resultChunks);
@@ -510,7 +562,10 @@ async function handleReport(request, env) {
   if (!job) return fail("没有这个任务", 404);
   const body = await request.json().catch(() => ({}));
   if (body.status && ["queued", "running", "done", "failed"].includes(body.status)) {
-    job.status = body.status;
+    // 只升不降：done 之后迟到的 running/queued 一律忽略，避免把好记录写坏
+    if (job.status !== "done" || body.status === "done") {
+      job.status = body.status;
+    }
   }
   if (body.note) job.note = String(body.note).slice(0, 500);
   if (body.stats) job.stats = body.stats;
