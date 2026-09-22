@@ -76,12 +76,17 @@ jobs:
             st=$(curl -fsS --max-time 60 -H "x-password: $PW" "$WORKER/api/status?id=$JOB")
             status=$(printf '%s' "$st" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
             note=$(printf '%s' "$st" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("note",""))')
-            echo "  [$i] $status $note"
-            if [ "$status" = "done" ]; then ready=1; printf '%s' "$st" > status.json; break; fi
-            if [ "$status" = "failed" ]; then echo "::error::任务失败：$note"; exit 1; fi
+            # 页面靠 phase/stepIndex 显示"正在干嘛"，自检也要能看到它
+            phase=$(printf '%s' "$st" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("phase",""))')
+            step=$(printf '%s' "$st" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%s/%s" % (d.get("stepIndex",0), d.get("stepTotal",0)))')
+            echo "  [$i] $status · $phase （第 $step 步） $note"
+            [ -n "$phase" ] && saw_phase=1
+            [ "$status" = "done" ] && { ready=1; printf '%s' "$st" > status.json; break; }
+            [ "$status" = "failed" ] && { echo "::error::任务失败：$note"; exit 1; }
             sleep 10
           done
           [ "$ready" = "1" ] || { echo "::error::等太久还没完成"; exit 1; }
+          [ "${saw_phase:-0}" = "1" ] || echo "::warning::整个过程中没看到阶段文字（phase）为空"
 
           echo "── 5. 下载译文并检查 ──"
           curl -fsS --max-time 600 -o out.bin "$WORKER/api/download?id=$JOB&password=$PW"

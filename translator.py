@@ -611,6 +611,22 @@ def load_glossary(explicit: str | None = None) -> dict:
     return {}
 
 
+_GLOSSARY_RE_CACHE: dict = {}
+
+
+def _glossary_pattern(key: str):
+    """单词类术语的「按词边界匹配」正则，编译结果缓存起来。
+
+    术语表有 800+ 条时，每批都要跑 800 多次匹配；Python 自带的正则缓存只有
+    512 个槽位，会不停重编译同一个 pattern。自己缓存后开销基本只剩匹配本身。
+    """
+    pat = _GLOSSARY_RE_CACHE.get(key)
+    if pat is None:
+        pat = re.compile(r"(?<![A-Za-z])" + re.escape(key) + r"(?![A-Za-z])", re.I)
+        _GLOSSARY_RE_CACHE[key] = pat
+    return pat
+
+
 def _context_block(context: dict | None, items: list[str]) -> str:
     """把「文档背景 + 相关术语」拼成提示词里的一小段。
 
@@ -639,11 +655,16 @@ def _context_block(context: dict | None, items: list[str]) -> str:
             if " " in key or "-" in key:
                 hit = key.lower() in blob.lower()
             else:
-                hit = re.search(r"(?<![A-Za-z])" + re.escape(key) + r"(?![A-Za-z])",
-                                blob, re.I) is not None
+                # ★ 术语表有 800+ 条时，每批都要跑 800 多次正则；Python 自带的正则缓存
+                #   只有 512 个槽，会不停重编译。这里自己缓存编译结果。
+                hit = _glossary_pattern(key).search(blob) is not None
             if hit:
                 hits.append((key, val))
         if hits:
+            # ★ 术语表大了以后，一批里命中几十条是常事，而注入上限是 20 条。
+            #   必须让**更长、更具体**的术语优先（marginal revenue > revenue），
+            #   否则泛词会挤掉真正需要约束的专业词。
+            hits.sort(key=lambda kv: (-len(kv[0]), kv[0]))
             parts.append("Established terminology (must be followed):\n"
                          + "; ".join(f"{k} → {v}" for k, v in hits[:20]))
     if not parts:

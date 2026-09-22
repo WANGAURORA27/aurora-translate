@@ -31,6 +31,10 @@ export const PAGE = `<!DOCTYPE html>
   .hidden { display:none !important; }
   .bar { height:8px; background:#eef1f6; border-radius:99px; overflow:hidden; margin:14px 0 8px; }
   .bar > i { display:block; height:100%; width:0; background:var(--brand); transition:width .25s; }
+  .spin { display:inline-block; width:12px; height:12px; margin-right:8px; border:2px solid #cfd8e8;
+          border-top-color:var(--brand); border-radius:50%; animation:aurora-spin .9s linear infinite;
+          vertical-align:-2px; }
+  @keyframes aurora-spin { to { transform: rotate(360deg); } }
   .muted { color:var(--sub); font-size:13px; }
   .status { font-weight:600; }
   .status.done { color:var(--ok); }
@@ -87,10 +91,11 @@ export const PAGE = `<!DOCTYPE html>
 
     <div class="card hidden" id="jobcard">
       <h2>翻译进度</h2>
-      <p class="status" id="jstatus">排队中</p>
+      <p class="status" id="jstatus"><span class="spin" id="jspin"></span><span id="jtext">排队中</span></p>
       <p class="muted" id="jname"></p>
-      <p class="muted" id="jnote"></p>
       <div class="bar"><i id="jbar"></i></div>
+      <p class="muted" id="jstep"></p>
+      <p class="muted" id="jnote"></p>
       <p class="muted" id="jstats"></p>
       <a class="dl hidden" id="jdl" href="#">下载译文</a>
       <p class="tip hidden" id="jlink"></p>
@@ -106,13 +111,21 @@ export const PAGE = `<!DOCTYPE html>
 <script>
 var pw = sessionStorage.getItem('aurora_pw') || '';
 var polling = null;
+var elapsedBase = 0;     // 服务端给的已用秒数
+var lastJob = null;      // 最近一次状态，供本地秒表使用
+var clockTimer = null;
 
 function $(id) { return document.getElementById(id); }
 
-function say(id, text, cls) {
-  var el = $(id);
-  el.textContent = text;
-  el.className = cls ? ('status ' + cls) : (id === 'jstatus' ? 'status' : el.className);
+/** 本地秒表：每秒钟把"已用时间"往上加，不用一直去问服务器 */
+function startClock() {
+  if (clockTimer) return;
+  clockTimer = setInterval(function () {
+    if (!lastJob) return;
+    if (lastJob.status !== 'running' && lastJob.status !== 'queued') return;
+    elapsedBase += 1;
+    tickClock(lastJob);
+  }, 1000);
 }
 
 function api(path, opts) {
@@ -186,24 +199,37 @@ function watch(id, name, mode, target) {
   if (polling) clearInterval(polling);
   poll(id);
   polling = setInterval(function () { poll(id); }, 4000);
+  startClock();
   $('jobcard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 function poll(id) {
   api('/api/status?id=' + id).then(function (r) { return r.json(); }).then(function (d) {
-    if (!d.ok) { say('jstatus', d.error || '查询失败', 'failed'); return; }
-    var label = d.status === 'done' ? '翻译完成' : d.status === 'failed' ? '翻译失败'
-              : d.status === 'running' ? '正在翻译…' : '排队中…';
-    say('jstatus', label, d.status === 'done' ? 'done' : d.status === 'failed' ? 'failed' : '');
+    if (!d.ok) { setJobText(d.error || '查询失败', 'failed'); return; }
+    lastJob = d;
+    var running = d.status === 'running' || d.status === 'queued';
+    setJobText(d.phase || (d.status === 'done' ? '翻译完成' : d.status === 'failed' ? '翻译失败' : '处理中…'),
+               d.status === 'done' ? 'done' : d.status === 'failed' ? 'failed' : '', running);
+
+    // 进度条：优先用"第几步/共几步"这个真实比例，没有就退回粗估
+    var pct = 12;
+    if (d.status === 'done') pct = 100;
+    else if (d.stepTotal > 0 && d.stepIndex > 0) pct = Math.min(96, Math.round(d.stepIndex / d.stepTotal * 100));
+    else if (d.status === 'running') pct = 55;
+    $('jbar').style.width = pct + '%';
+
+    elapsedBase = d.elapsedSec || 0;
+    tickClock(d);
     $('jnote').textContent = d.note || '';
-    $('jbar').style.width = d.status === 'done' ? '100%' : d.status === 'running' ? '62%' : '12%';
     if (d.stats) {
       var s = d.stats;
       var bits = [];
       if (s.pages) bits.push(s.pages + ' 页');
-      if (s.lines) bits.push(s.lines + ' 段');
-      if (s.seconds) bits.push(Math.round(s.seconds) + ' 秒');
-      if (s.chars) bits.push(s.chars + ' 字');
+      if (s.units) bits.push(s.units + ' 段');
+      if (s.api_calls) bits.push('调用 ' + s.api_calls + ' 次');
+      if (s.api_tokens_in) bits.push('入 ' + s.api_tokens_in + ' tokens');
+      if (s.seconds) bits.push('耗时 ' + Math.round(s.seconds) + ' 秒');
+      if (s.outputMB) bits.push(s.outputMB + ' MB');
       $('jstats').textContent = bits.join(' · ');
     }
     if (d.ready) {
@@ -224,6 +250,21 @@ function poll(id) {
       $('jlink').appendChild(a);
     }
   }).catch(function () {});
+}
+
+/** 状态文字 + 转圈图标（完成后停转） */
+function setJobText(text, cls, spinning) {
+  $('jtext').textContent = text;
+  $('jstatus').className = 'status' + (cls ? ' ' + cls : '');
+  $('jspin').style.display = spinning ? 'inline-block' : 'none';
+}
+
+/** 显示"共 x/y 步 · 已用 mm:ss"，本地每秒自增，不用一直问服务器 */
+function tickClock(d) {
+  var secs = elapsedBase;
+  var step = (d && d.stepTotal > 0 && d.stepIndex > 0) ? ('第 ' + d.stepIndex + '/' + d.stepTotal + ' 步 · ') : '';
+  var m = Math.floor(secs / 60), s = secs % 60;
+  $('jstep').textContent = step + '已用 ' + m + ' 分 ' + (s < 10 ? '0' : '') + s + ' 秒';
 }
 
 function loadHistory() {

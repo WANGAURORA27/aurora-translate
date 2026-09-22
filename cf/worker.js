@@ -198,6 +198,32 @@ async function ghFetch(env, path, init = {}) {
   return fetch("https://api.github.com/repos/" + env.GH_REPO + path, { ...init, headers });
 }
 
+/**
+ * 把 Actions 里正在跑的那一步翻译成"人话"，让人一眼知道现在在干嘛。
+ * 顺序有讲究：先匹配更具体的（"安装系统" 要在 "翻译" 之前判）。
+ */
+const PHASE_RULES = [
+  ["安装系统", "正在准备翻译环境（装 OCR 引擎与中文字体，首次约 1~2 分钟）"],
+  ["安装 Python", "正在安装翻译依赖"],
+  ["取原件", "正在取回你的文件"],
+  ["开始翻译", "正在启动翻译"],
+  ["回传译文", "正在回传译文"],
+  ["回传统计", "正在收尾"],
+  ["翻译", "正在翻译正文（最耗时的一步）"],
+  ["setup-python", "正在准备运行环境"],
+  ["checkout", "正在准备运行环境"],
+  ["Set up job", "正在分配运行机器"],
+  ["Complete job", "正在收尾"],
+];
+
+function phaseFor(stepName) {
+  if (!stepName) return "";
+  for (const [needle, text] of PHASE_RULES) {
+    if (stepName.includes(needle)) return text;
+  }
+  return stepName;
+}
+
 /** 问 GitHub 这个 run 到哪一步了，只在距离上次查超过 8 秒时才真去问（省调用次数） */
 async function refreshFromGitHub(env, job) {
   if (!job.runId) return job;
@@ -236,6 +262,26 @@ async function refreshFromGitHub(env, job) {
         job.status = "running";
       } else {
         job.status = "queued";
+      }
+    }
+
+    // 再看一眼"具体跑到哪一步了"：把 Actions 里正在执行的那一步翻译成人话，
+    // 顺便给出 第几步/共几步，页面上的进度条就能真的动起来。
+    if (job.status === "running" || job.status === "queued") {
+      const jobsResp = await ghFetch(env, "/actions/runs/" + job.runId + "/jobs");
+      if (jobsResp.ok) {
+        const data = await jobsResp.json();
+        const list = data.jobs || [];
+        const target = list.find((j) => j.name === "cloud") || list[0];
+        if (target) {
+          const steps = target.steps || [];
+          const running = steps.findIndex((s) => s.status === "in_progress");
+          const doneCount = steps.filter((s) => s.status === "completed").length;
+          job.stepTotal = steps.length;
+          job.stepIndex = running >= 0 ? running + 1 : Math.max(doneCount, 1);
+          if (running >= 0) job.phase = phaseFor(steps[running].name);
+          else if (target.status === "queued") job.phase = "已排队，等 GitHub 分配机器…";
+        }
       }
     }
   } catch (err) {
@@ -361,6 +407,12 @@ async function handleStatus(request, env, url) {
   let job = await readJob(env, id);
   if (!job) return fail("没有这个任务（记录保留 7 天）", 404);
   job = await refreshFromGitHub(env, job);
+  const queued = job.status === "queued";
+  const phase = job.status === "done"
+    ? "翻译完成"
+    : job.status === "failed"
+      ? (job.note || "翻译失败")
+      : job.phase || (queued ? "已排队，马上开始…" : "正在翻译…");
   return json({
     ok: true,
     id: job.id,
@@ -370,7 +422,13 @@ async function handleStatus(request, env, url) {
     target: job.target,
     size: job.size,
     status: job.status,
+    // phase 是"给人看的当前阶段"，note 是更细的说明
+    phase,
     note: job.note || "",
+    stepIndex: job.stepIndex || 0,
+    stepTotal: job.stepTotal || 0,
+    // 从提交到现在过了多久（页面自己再往上加秒数，避免频繁请求）
+    elapsedSec: Math.max(0, Math.round((Date.now() - (job.createdAt || Date.now())) / 1000)),
     runUrl: job.runUrl || "",
     ready: job.status === "done",
     stats: job.stats || null,
