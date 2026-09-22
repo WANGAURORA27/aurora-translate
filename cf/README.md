@@ -42,14 +42,28 @@ export CLOUDFLARE_API_TOKEN="$(tr -d ' \r\n' < .secrets/cf_token)"
 wrangler whoami
 ```
 
-### 2. GitHub 令牌（给 Worker 用来触发 Actions）
+> 输出里写着 **Account API Token** 是正常的（这种令牌挂在账户下）。
+> 但别拿 `curl .../user/tokens/verify` 去验它 —— 那个接口只认**用户级**令牌，
+> 账户级令牌去问一律回 `401 Invalid API Token`，会让人白白以为令牌坏了。
+> 账户级的验证地址是 `/accounts/<account_id>/tokens/verify`。
+
+### 2. 先开通 R2（一次性，必须）
+
+大文件中转靠 R2，但它**必须先手动开通**，否则建桶时会回
+`Please enable R2 through the Cloudflare Dashboard`。
+
+打开 <https://dash.cloudflare.com> → 左侧 **R2** → 按提示开通。
+免费额度是 **10GB 存储 / 月**，**出站流量不收费**；我们只放 7 天内的文件，
+基本碰不到上限。开通需要绑一张卡，但免费额度内不会产生费用。
+
+### 3. GitHub 令牌（给 Worker 用来触发 Actions）
 
 Worker 需要调用 `workflow_dispatch` 派活。最省事的就是复用 `gh` 的登录态
 （`gh auth token`），部署脚本会自动处理；想更规范就建一个**细粒度 PAT**
 （Repository permissions → Actions: Read and write、Contents: Read），
 放到 `.secrets/gh_pat`，脚本会优先用它。
 
-### 3. 使用口令
+### 4. 使用口令
 
 `.secrets/password` 里写你想给使用者用的口令；文件不存在时脚本会自动生成一个并打印出来。
 
@@ -59,9 +73,9 @@ Worker 需要调用 `workflow_dispatch` 派活。最省事的就是复用 `gh` �
 bash cf/deploy.sh
 ```
 
-脚本会依次：验证凭据 → 建 KV → 建 R2 桶 → 写三个密钥（PASSWORD / AGENT_KEY / GH_TOKEN）
-→ 部署 → 把网址和内部密钥同步给 GitHub（`WORKER_URL` 变量、`AGENT_KEY` 密钥），
-最后打印网址与口令。重复跑是安全的，已存在的资源会跳过。
+脚本会依次：验证凭据 → 检查 R2 是否开通 → 建 KV → 建 R2 桶 → 写三个密钥
+（PASSWORD / AGENT_KEY / GH_TOKEN）→ 部署 → 把网址和内部密钥同步给 GitHub
+（`WORKER_URL` 变量、`AGENT_KEY` 密钥），最后打印网址与口令。重复跑是安全的，已存在的资源会跳过。
 
 ## 三、手动部署（脚本不好使时）
 
