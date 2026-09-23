@@ -99,7 +99,7 @@ URL=$(printf '%s' "$DEPLOY_LOG" | grep -oE 'https://[a-z0-9.-]+\.workers\.dev' |
 [ -n "$URL" ] || warn "没认出 workers.dev 地址（不影响绑自定义域名）"
 
 step "7/7 绑定域名 $HOST"
-bash "$HERE/set-domain.sh" "$HOST" 2>&1 | tail -12
+bash "$HERE/set-domain.sh" "$HOST" aurora-account 2>&1 | tail -12
 printf '%s' "$HOST" > "$SECRETS/account_domain"
 
 cat <<EOF

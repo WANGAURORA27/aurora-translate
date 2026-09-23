@@ -12,12 +12,12 @@ enabled = true
 [[d1_databases]]
 binding = "DB"
 database_name = "aurora-account"
-database_id = "REPLACE_WITH_D1_ID"
+database_id = "90980376-a702-4617-a3c0-1fd2798e7179"
 
 # 限流计数器（发验证码、登录尝试）
 [[kv_namespaces]]
 binding = "LIMITS"
-id = "REPLACE_WITH_LIMITS_ID"
+id = "6b43ca1d79a64adeb3f64638e1b29a45"
 
 [vars]
 MAIL_FROM = "Aurora <no-reply@ourmetaverse.cn>"

@@ -11,10 +11,13 @@
 set -euo pipefail
 
 HOST="${1:-doc.ourmetaverse.cn}"
+WORKER_NAME_ARG="${2:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 SECRETS="$REPO/.secrets"
+# Worker 名字：第二个参数优先，否则默认翻译站
 WORKER_NAME="aurora-translate"
+[ -n "$WORKER_NAME_ARG" ] && WORKER_NAME="$WORKER_NAME_ARG"
 ACCOUNT_ID="873e57a00b1805cf864e89ea563ec072"
 
 ok()   { printf '\033[32m%s\033[0m\n' "$1"; }
