@@ -52,10 +52,10 @@ def gen_assets() -> str:
             text = text.replace(
                 "if (!S._v12) { S.maxSegMs = 5000; S.tailMs = 600; S._v12 = 1; }",
                 "if (!S._v12) { S.maxSegMs = 5000; S.tailMs = 600; S._v12 = 1; }\n"
-                "if (!S._lbA) { S.voiceOn = false; S._lbA = 1; saveS(); }   // 本站默认：关闭语音播报\n"
+                "if (!S._lbA) { S.voiceOn = false; S._lbA = 1; try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }   // 本站默认：关闭语音播报\n"
                 "if (!S._lbB) { S.preview = false; S.topFeed = false; S.tailMs = 900; "
-                "S.ctx = true; S.voiceBoost = true; S._lbB = 1; saveS(); }   // 本站默认：稳定大块手感\n"
-                "if (!S._lbC) { S.refineGpt = false; S._lbC = 1; saveS(); }   // 本站默认：关掉定稿精修，省一跳", 1)
+                "S.ctx = true; S.voiceBoost = true; S._lbB = 1; try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }   // 本站默认：稳定大块手感\n"
+                "if (!S._lbC) { S.refineGpt = false; S._lbC = 1; try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }   // 本站默认：关掉定稿精修，省一跳", 1)
         out.append("  %s: %s," % (json.dumps(name), json.dumps(text, ensure_ascii=False)))
     out.append("};")
     # 术语表：live 自带 + 文档翻译那份（978 条经管术语）+ 数学课常用词
