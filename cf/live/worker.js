@@ -11,6 +11,24 @@ let LIVE_ENV = {};
 let LIVE_CTX = null;
 let LIVE_USER = null;      // 本次请求的登录用户（用于计费）
 
+// 会话校验结果的内存缓存：同一个人 60 秒内只查一次库。
+// 为什么重要：每个 API 请求都要校验登录，直接查 D1 会给"每说一句话"都加 50~150ms。
+const SESSION_CACHE = new Map();
+const SESSION_TTL = 60;
+async function cachedUser(env, request) {
+  const cookie = request.headers.get("cookie") || "";
+  const m = /aurora_session=([^;]+)/.exec(cookie);
+  if (!m) return null;
+  const key = m[1];
+  const hit = SESSION_CACHE.get(key);
+  if (hit && Date.now() - hit.at < SESSION_TTL * 1000) return hit.user;
+  let user = null;
+  try { user = env.DB ? await currentUser(env, request) : null; } catch (e) { user = null; }
+  if (SESSION_CACHE.size > 200) SESSION_CACHE.clear();
+  SESSION_CACHE.set(key, { at: Date.now(), user });
+  return user;
+}
+
 /** 兜底去重：同一段里出现高度重复的两句时，只保留第一句（字符二元组相似度 ≥0.62 视为重复） */
 function dedupeSentences(text) {
   const src = String(text || "").trim();
@@ -1388,8 +1406,7 @@ export default {
     // 登录门：静态页面与健康检查放行，其余 API 必须带账户会话
     if (url.pathname.startsWith("/api/")
         && url.pathname !== "/api/health" && url.pathname !== "/api/healthz" && url.pathname !== "/api/me") {
-      let who = null;
-      try { who = env.DB ? await currentUser(env, request) : null; } catch (e) { who = null; }
+      const who = await cachedUser(env, request);
       LIVE_USER = who;
       if (!who) {
         return new Response(JSON.stringify({
@@ -1405,8 +1422,7 @@ export default {
     }
 
     if (url.pathname === "/api/me") {
-      let who = null;
-      try { who = env.DB ? await currentUser(env, request) : null; } catch (e) { who = null; }
+      const who = await cachedUser(env, request);
       return new Response(JSON.stringify(who
         ? { ok: true, logged_in: true, user: { email: who.email, role: who.role } }
         : { ok: true, logged_in: false }), { headers: { "content-type": "application/json; charset=utf-8" } });
@@ -1432,10 +1448,11 @@ export default {
 
     // 计费（只在接口成功时）：把本次音频秒数累加进 D1，满一分钟才扣 1 页
     if (meterStt && res._status >= 200 && res._status < 300 && audioBytes > 0 && LIVE_USER && env.DB) {
-      try {
-        const secs = estAudioSeconds(audioBytes, request.headers.get("content-type") || "");
-        if (secs > 0) await meterLive(env, LIVE_USER.id, secs);
-      } catch (e) { /* 计费失败不影响翻译 */ }
+      // ★ 放到后台执行：计费要写两次 D1，阻塞在返回前会给每句话加 100~300ms
+      const secs = estAudioSeconds(audioBytes, request.headers.get("content-type") || "");
+      const uid = LIVE_USER.id;
+      const task = secs > 0 ? meterLive(env, uid, secs).catch(() => {}) : Promise.resolve();
+      if (ctx && ctx.waitUntil) ctx.waitUntil(task); else task.catch(() => {});
     }
 
     const outHeaders = new Headers();
