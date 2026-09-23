@@ -16,8 +16,10 @@
  */
 
 import { PAGE } from "./page.js";
+// 会话/额度逻辑与翻译站共用同一份（见 cf/shared/session.js），避免安全代码抄两遍
+import { SESSION_COOKIE, parseCookies, sha256Hex, safeEqual, currentUser, sessionCookie }
+  from "../shared/session.js";
 
-const SESSION_COOKIE = "aurora_session";
 const SESSION_TTL = 30 * 24 * 3600; // 30 天
 const CODE_TTL = 10 * 60; // 验证码 10 分钟
 const PBKDF2_ITER = 100000;
@@ -46,19 +48,6 @@ function randomToken(bytes = 32) {
   const buf = new Uint8Array(bytes);
   crypto.getRandomValues(buf);
   return b64(buf).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-async function sha256Hex(text) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/** 定时安全比较：不要用 === 比哈希，会被时序攻击 */
-function safeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
 }
 
 const normEmail = (v) => String(v || "").trim().toLowerCase();
@@ -150,15 +139,6 @@ async function tooMany(env, keys) {
 
 // ── 会话 ──────────────────────────────────────────────────────────────
 
-function parseCookies(request) {
-  const out = {};
-  for (const part of (request.headers.get("cookie") || "").split(";")) {
-    const [k, ...rest] = part.trim().split("=");
-    if (k) out[k] = decodeURIComponent(rest.join("=") || "");
-  }
-  return out;
-}
-
 async function createSession(env, userId, request) {
   const token = randomToken(32);
   const now = Math.floor(Date.now() / 1000);
@@ -170,29 +150,6 @@ async function createSession(env, userId, request) {
     request.headers.get("cf-connecting-ip") || "",
   ).run();
   return token;
-}
-
-function sessionCookie(token, maxAge) {
-  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
-}
-
-async function currentUser(env, request) {
-  const token = parseCookies(request)[SESSION_COOKIE];
-  if (!token) return null;
-  const now = Math.floor(Date.now() / 1000);
-  const row = await env.DB.prepare(
-    `SELECT s.token_hash, s.expires_at, u.id, u.email, u.role, u.status,
-            u.quota_pages, u.used_pages, u.quota_reset_at, u.created_at
-       FROM sessions s JOIN users u ON u.id = s.user_id
-      WHERE s.token_hash = ?`,
-  ).bind(await sha256Hex(token)).first();
-  if (!row) return null;
-  if (row.expires_at < now) {
-    await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(row.token_hash).run();
-    return null;
-  }
-  if (row.status !== "active") return null;
-  return row;
 }
 
 async function audit(env, actorId, targetId, action, detail, request) {
@@ -308,7 +265,7 @@ async function apiRegister(request, env, url) {
   await audit(env, userId, userId, "register", email, request);
   const token = await createSession(env, userId, request);
   return json({ ok: true, user: { email, role: isFirst ? "admin" : "user" } }, 200, {
-    "set-cookie": sessionCookie(token, SESSION_TTL),
+    "set-cookie": sessionCookie(token, SESSION_TTL, env.COOKIE_DOMAIN),
   });
 }
 
@@ -337,7 +294,7 @@ async function apiLogin(request, env, url) {
   await audit(env, user.id, user.id, "login", "", request);
   const token = await createSession(env, user.id, request);
   return json({ ok: true, user: { email: user.email, role: user.role } }, 200, {
-    "set-cookie": sessionCookie(token, SESSION_TTL),
+    "set-cookie": sessionCookie(token, SESSION_TTL, env.COOKIE_DOMAIN),
   });
 }
 
@@ -346,7 +303,7 @@ async function apiLogout(request, env) {
   if (token) {
     await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await sha256Hex(token)).run();
   }
-  return json({ ok: true }, 200, { "set-cookie": sessionCookie("", 0) });
+  return json({ ok: true }, 200, { "set-cookie": sessionCookie("", 0, env.COOKIE_DOMAIN) });
 }
 
 async function apiResetPassword(request, env) {
@@ -390,7 +347,7 @@ async function apiChangePassword(request, env) {
     .bind(await hashPassword(newPass), user.id).run();
   await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(user.id).run();
   await audit(env, user.id, user.id, "change-password", "", request);
-  return json({ ok: true, message: "密码已修改，请重新登录" }, 200, { "set-cookie": sessionCookie("", 0) });
+  return json({ ok: true, message: "密码已修改，请重新登录" }, 200, { "set-cookie": sessionCookie("", 0, env.COOKIE_DOMAIN) });
 }
 
 async function apiMe(request, env) {

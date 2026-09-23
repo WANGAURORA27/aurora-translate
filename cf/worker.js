@@ -21,6 +21,8 @@
  */
 
 import { PAGE } from "./page.js";
+// 与账户站共用同一份会话/额度逻辑，并读同一个 D1（阶段 2）
+import { currentUser, quotaState, addUsage } from "./shared/session.js";
 
 const MAX_UPLOAD = 95 * 1024 * 1024; // Workers 免费版请求体上限 100MB，留点余量
 const CHUNK = 20 * 1024 * 1024; // KV 单值上限 25MiB，切 20MiB 一块最稳
@@ -336,11 +338,39 @@ async function adoptRun(env, jobId) {
 
 // ── 鉴权 ─────────────────────────────────────────────────────────────
 
-function authorizeUser(request, env, url) {
+/**
+ * 鉴权（阶段 2 起）：
+ *   ① 登录会话 —— 正常路径，读取 D1 里的会话，顺带核对本月额度
+ *   ② 管理口令 —— 自动化线上自检与应急通道（不占任何人额度）
+ * 返回 { user } / { admin: true } / { error }
+ */
+async function authorizeUser(request, env, url) {
+  if (env.DB) {
+    try {
+      const user = await currentUser(env, request);
+      if (user) {
+        const q = quotaState(user);
+        if (!q.unlimited && q.remaining <= 0) {
+          return { user, error: `本月额度已用完（已用 ${q.used}/${q.quota} 页），下个月自动恢复，或找管理员加额度` };
+        }
+        return { user };
+      }
+    } catch (err) {
+      // 数据库暂时读不到就退到口令通道，别把服务卡死
+    }
+  }
   const given = request.headers.get("x-password") || url.searchParams.get("password") || "";
-  if (!env.PASSWORD) return "服务端还没设置口令（PASSWORD）";
-  if (given !== env.PASSWORD && decodeHeader(given) !== env.PASSWORD) return "口令不对";
-  return null;
+  if (env.PASSWORD && (given === env.PASSWORD || decodeHeader(given) === env.PASSWORD)) {
+    return { admin: true };
+  }
+  return { error: "请先登录后再使用（没有账号？去 account.ourmetaverse.cn 注册，第一个账号是管理员）" };
+}
+
+/** 任务归属校验：不是自己的任务不给看（管理员例外） */
+function ownedBy(job, auth) {
+  if (!job.userId) return true;              // 口令通道创建的任务
+  if (!auth.user) return false;
+  return auth.user.id === job.userId || auth.user.role === "admin";
 }
 
 function authorizeAgent(request, env) {
@@ -352,8 +382,8 @@ function authorizeAgent(request, env) {
 // ── 接口 ─────────────────────────────────────────────────────────────
 
 async function handleUpload(request, env, ctx) {
-  const daren = authorizeUser(request, env, new URL(request.url));
-  if (daren) return fail(daren, 401);
+  const auth = await authorizeUser(request, env, new URL(request.url));
+  if (auth.error) return fail(auth.error, auth.user ? 402 : 401);
 
   const name = decodeHeader(request.headers.get("x-filename"));
   if (!name) return fail("没收到文件名");
@@ -399,6 +429,8 @@ async function handleUpload(request, env, ctx) {
     inputChunks: written.count,
     inputSize: size,
     source: "cloud",
+    userId: auth.user ? auth.user.id : null,      // 完成后按页扣他的额度
+    userEmail: auth.user ? auth.user.email : "",
   };
   await saveJob(env, job);
 
@@ -445,12 +477,13 @@ function defaultResultName(job) {
 }
 
 async function handleStatus(request, env, url) {
-  const daren = authorizeUser(request, env, url);
-  if (daren) return fail(daren, 401);
+  const auth = await authorizeUser(request, env, url);
+  if (auth.error) return fail(auth.error, 401);
   const id = url.searchParams.get("id");
   if (!id) return fail("缺少 id");
   let job = await readJob(env, id);
   if (!job) return fail("没有这个任务（记录保留 7 天）", 404);
+  if (!ownedBy(job, auth)) return fail("这个任务不属于当前账号", 403);
   job = await healJob(env, job);
 
   // 以下都是"派生状态"：只用于这次响应，**不写回 KV**（写回会覆盖 Actions 的真实上报）
@@ -515,11 +548,12 @@ async function handleStatus(request, env, url) {
 }
 
 async function handleDownload(request, env, url) {
-  const daren = authorizeUser(request, env, url);
-  if (daren) return fail(daren, 401);
+  const auth = await authorizeUser(request, env, url);
+  if (auth.error) return fail(auth.error, 401);
   const id = url.searchParams.get("id");
   let job = await readJob(env, id);
   if (!job) return fail("没有这个任务", 404);
+  if (!ownedBy(job, auth)) return fail("这个任务不属于当前账号", 403);
   // 记录说没完成也不算数：先去存储里看译文块在不在（跨机房延迟会把记录写乱）
   job = await healJob(env, job);
   if (!job.resultChunks) return fail("译文还没好", 409);
@@ -607,18 +641,62 @@ async function handleReport(request, env) {
   }
   if (body.note) job.note = String(body.note).slice(0, 500);
   if (body.stats) job.stats = body.stats;
+
+  // 按页扣额度并写用量流水（幂等：同一个任务只记一次）
+  if (job.userId && !job.usageRecorded && job.stats && Number(job.stats.pages) >= 0) {
+    try {
+      const pages = Number(job.stats.pages) || 0;
+      await addUsage(env, job.userId, {
+        jobId: job.id,
+        pages,
+        tokensIn: job.stats.api_tokens_in,
+        tokensOut: job.stats.api_tokens_out,
+        note: `${job.mode || ""} · ${job.name || ""}`,
+      });
+      job.usageRecorded = true;
+    } catch (err) {
+      // 记账失败不让任务失败，下轮状态查询还会再试
+    }
+  }
   await saveJob(env, job);
   return json({ ok: true });
 }
 
+/** 页面用：当前登录状态 + 剩余额度（未登录不算错误，返回 logged_in:false） */
+async function handleMe(request, env) {
+  if (!env.DB) return json({ ok: true, logged_in: false, note: "未绑定账户库" });
+  let user = null;
+  try {
+    user = await currentUser(env, request);
+  } catch (err) {
+    user = null;
+  }
+  if (!user) return json({ ok: true, logged_in: false });
+  const q = quotaState(user);
+  return json({
+    ok: true,
+    logged_in: true,
+    user: { email: user.email, role: user.role },
+    quota: {
+      unlimited: q.unlimited,
+      quota: q.quota,
+      used: q.used,
+      remaining: q.unlimited ? -1 : q.remaining,
+    },
+  });
+}
+
 async function handleHistory(request, env, url) {
-  const daren = authorizeUser(request, env, url);
-  if (daren) return fail(daren, 401);
+  const auth = await authorizeUser(request, env, url);
+  if (auth.error) return fail(auth.error, 401);
   const list = await env.JOBS.list({ prefix: "job:", limit: 100 });
   const jobs = [];
+  const mine = auth.user ? auth.user.id : null;
+  const isAdmin = auth.admin || (auth.user && auth.user.role === "admin");
   for (const key of list.keys) {
     const job = await env.JOBS.get(key.name, "json");
     if (!job) continue;
+    if (!isAdmin && (job.userId || null) !== mine) continue;   // 只看自己的
     jobs.push({
       id: job.id,
       name: job.name,
@@ -642,9 +720,10 @@ export default {
       if (path === "/" || path === "/index.html") {
         return new Response(PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
       }
+      if (path === "/api/me") return await handleMe(request, env);
       if (path === "/api/verify") {
-        const daren = authorizeUser(request, env, url);
-        return daren ? fail(daren, 401) : json({ ok: true });
+        const auth = await authorizeUser(request, env, url);
+        return auth.error ? fail(auth.error, 401) : json({ ok: true, admin: !!auth.admin });
       }
       if (path === "/api/upload" && request.method === "PUT") return await handleUpload(request, env, ctx);
       if (path === "/api/status" && request.method === "GET") return await handleStatus(request, env, url);

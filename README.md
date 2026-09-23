@@ -31,6 +31,15 @@
 **想先试试？** 用仓库里的样例文件 [`samples/demo.pdf`](samples/demo.pdf)（自带数学符号 `√ ∂ ∆ ⊂` 与一个图形），
 把它拖进文件框就能看到完整效果。
 
+## 账户系统（阶段 1 已上线）
+
+**<https://account.ourmetaverse.cn>** —— ourmetaverse.cn 的统一账号：注册（邮箱验证码）、
+登录、忘记密码、权限（user / vip / admin）、每月页数额度、管理后台。
+
+跑在 Cloudflare Workers + D1 上，不需要服务器、不需要备案。安全设计：密码 PBKDF2-SHA256
+加盐 10 万次迭代、会话只存 token 哈希、验证码只存哈希、HttpOnly+Secure Cookie、
+写接口校验 Origin。详见 [`cf/account/README.md`](cf/account/README.md)。
+
 ## 网页版（口令门 + 大文件）
 
 另外有一个网页入口，适合传**大文件**、或不想碰 GitHub 的人：

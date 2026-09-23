@@ -20,6 +20,8 @@ binding = "LIMITS"
 id = "6b43ca1d79a64adeb3f64638e1b29a45"
 
 [vars]
+# 让 doc.ourmetaverse.cn 也能读到登录状态（会话共享）
+COOKIE_DOMAIN = ".ourmetaverse.cn"
 MAIL_FROM = "Aurora <no-reply@ourmetaverse.cn>"
 # 设成 1 时，验证码会直接回给调用方（只用于本地开发，线上必须为 0）
 DEV_SHOW_CODE = "0"

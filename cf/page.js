@@ -55,11 +55,20 @@ export const PAGE = `<!DOCTYPE html>
   <h1>Aurora 文档翻译</h1>
   <p class="lead">上传 PDF / Word，保持原来的排版把文字换成中文，公式和图表都会留着。</p>
 
-  <div class="card" id="gate">
-    <h2>请输入使用口令</h2>
-    <input type="password" id="pw" placeholder="口令" autocomplete="current-password">
-    <p class="tip" id="gatem">口令由站点主人提供，用来防止陌生人消耗翻译额度。</p>
-    <div style="margin-top:14px"><button id="gobtn">进入</button></div>
+  <div class="card" id="authcard">
+    <h2>账号</h2>
+    <p class="status" id="authstate">正在检查登录状态…</p>
+    <p class="muted" id="authquota"></p>
+    <div id="authlogin" class="hidden" style="margin-top:14px">
+      <a class="dl" href="https://account.ourmetaverse.cn/" target="_blank" rel="noopener">去登录 / 注册</a>
+      <p class="tip">登录后回到本页即可开始翻译。没有账号？注册只需一个邮箱收验证码。</p>
+    </div>
+    <details id="pwbox" style="margin-top:16px">
+      <summary class="muted" style="cursor:pointer">管理员 / 自动化：改用管理口令</summary>
+      <input type="password" id="pw" placeholder="管理口令" autocomplete="current-password" style="margin-top:10px">
+      <p class="tip" id="gatem">管理口令是应急通道，不占任何人的额度。</p>
+      <div style="margin-top:10px"><button id="gobtn">用口令进入</button></div>
+    </details>
   </div>
 
   <div id="app" class="hidden">
@@ -110,6 +119,7 @@ export const PAGE = `<!DOCTYPE html>
 
 <script>
 var pw = sessionStorage.getItem('aurora_pw') || '';
+var authed = false;          // 已通过登录或管理口令验证
 var polling = null;
 var elapsedBase = 0;     // 服务端给的已用秒数
 var lastJob = null;      // 最近一次状态，供本地秒表使用
@@ -134,20 +144,50 @@ function api(path, opts) {
   return fetch(path, opts);
 }
 
+/** 显示可用的上传界面 */
+function showApp() {
+  $('authcard').classList.add('hidden');
+  $('app').classList.remove('hidden');
+  loadHistory();
+}
+
+/** 用登录状态进入（阶段 2 的正常路径） */
+function checkAuth() {
+  api('/api/me').then(function (r) { return r.json(); }).then(function (d) {
+    if (d.ok && d.logged_in) {
+      authed = true;
+      var role = d.user.role === 'admin' ? '（管理员）' : (d.user.role === 'vip' ? '（VIP）' : '');
+      $('authstate').textContent = '已登录：' + d.user.email + role;
+      $('authquota').textContent = d.quota.unlimited
+        ? '额度：不限'
+        : '本月剩余 ' + d.quota.remaining + ' 页（已用 ' + d.quota.used + ' / ' + d.quota.quota + ' 页）';
+      showApp();
+      return;
+    }
+    authed = false;
+    $('authstate').textContent = '还没有登录';
+    $('authquota').textContent = '翻译需要先登录 —— 每个人的额度单独计算，互不影响。';
+    $('authlogin').classList.remove('hidden');
+  }).catch(function () {
+    $('authstate').textContent = '连不上服务器，稍后再试';
+  });
+}
+
+/** 管理口令通道（自动化自检 / 应急） */
 $('gobtn').onclick = function () {
   pw = $('pw').value.trim();
   if (!pw) { $('gatem').textContent = '先填口令'; return; }
   fetch('/api/verify', { headers: { 'x-password': pw } }).then(function (r) {
     if (!r.ok) { $('gatem').textContent = '口令不对，再试一次'; return; }
     sessionStorage.setItem('aurora_pw', pw);
-    $('gate').classList.add('hidden');
-    $('app').classList.remove('hidden');
-    loadHistory();
+    authed = true;
+    showApp();
   }).catch(function () { $('gatem').textContent = '连不上服务器，稍后再试'; });
 };
 $('pw').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('gobtn').click(); });
 
 $('upbtn').onclick = function () {
+  if (!authed) { $('upnote').textContent = '请先登录（或输入管理口令）'; return; }
   var f = $('file').files[0];
   if (!f) { $('upnote').textContent = '先选一个文件'; return; }
   var bar = $('ubar'), fill = bar.querySelector('i');
@@ -295,7 +335,9 @@ function loadHistory() {
   }).catch(function () {});
 }
 
-if (pw) { $('pw').value = pw; $('gobtn').click(); }
+if (pw) $('pw').value = pw;
+checkAuth();
+if (pw) setTimeout(function () { if (!authed) $('gobtn').click(); }, 600);
 </script>
 </body>
 </html>

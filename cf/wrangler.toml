@@ -21,8 +21,16 @@ id = "35f2a678dba04f4c8b10771f17d1d34a"
 # binding = "FILES"
 # bucket_name = "aurora-files"
 
+# 与账户站共用同一个 D1：读登录会话、扣用户额度（阶段 2）
+[[d1_databases]]
+binding = "DB"
+database_name = "aurora-account"
+database_id = "90980376-a702-4617-a3c0-1fd2798e7179"
+
 # 非密钥的配置放这里；密钥（PASSWORD / GH_TOKEN / AGENT_KEY）用 wrangler secret put 写
 [vars]
+# 与账户站共享登录 Cookie 的作用域
+COOKIE_DOMAIN = ".ourmetaverse.cn"
 GH_REPO = "WANGAURORA27/aurora-translate"
 WORKFLOW = "translate.yml"
 GH_REF = "main"
