@@ -47,9 +47,41 @@ def gen_assets() -> str:
     for name, text in items:
         if name == "index.html":
             text = text.replace("</body>", LOGIN_BANNER + "\n</body>") if "</body>" in text else text + LOGIN_BANNER
+        if name == "app.js":
+            # 一次性迁移：默认不朗读译文（想要播报可在设置里重新打开）
+            text = text.replace(
+                "if (!S._v12) { S.maxSegMs = 5000; S.tailMs = 600; S._v12 = 1; }",
+                "if (!S._v12) { S.maxSegMs = 5000; S.tailMs = 600; S._v12 = 1; }\n"
+                "if (!S._v13) { S.voiceOn = false; S._v13 = 1; saveS(); }   // v13：默认关闭语音播报", 1)
         out.append("  %s: %s," % (json.dumps(name), json.dumps(text, ensure_ascii=False)))
     out.append("};")
-    out.append("export const GLOSSARY_TEXT = %s;" % json.dumps(read(os.path.join(SRC_DIR, "glossary.json")), ensure_ascii=False))
+    # 术语表：live 自带 + 文档翻译那份（978 条经管术语）+ 数学课常用词
+    merged = {}
+    try:
+        merged.update(json.loads(read(os.path.join(SRC_DIR, "glossary.json"))))
+    except Exception:
+        pass
+    doc_glossary = os.path.join(REPO, "glossary.json")
+    if os.path.isfile(doc_glossary):
+        try:
+            doc = json.loads(read(doc_glossary))
+            for k, v in doc.items():
+                if str(k).startswith("_") or not isinstance(v, dict):
+                    continue
+                merged[k] = v
+        except Exception:
+            pass
+    merged["数学与微积分"] = {
+        "power": "幂", "power rule": "幂法则", "power chain rule": "幂函数的链式法则",
+        "chain rule": "链式法则", "derivative": "导数", "differentiate": "求导",
+        "integral": "积分", "integration": "积分", "limit": "极限", "continuous": "连续",
+        "function": "函数", "outer function": "外层函数", "inner function": "内层函数",
+        "composite function": "复合函数", "exponent": "指数", "logarithm": "对数",
+        "matrix": "矩阵", "vector": "向量", "theorem": "定理", "proof": "证明",
+        "partial derivative": "偏导数", "gradient": "梯度", "maxima": "极大值",
+        "minima": "极小值", "optimisation": "最优化", "constraint": "约束",
+    }
+    out.append("export const GLOSSARY_TEXT = %s;" % json.dumps(merged, ensure_ascii=False))
     out.append("export const ORAL_TEXT = %s;" % json.dumps(read(os.path.join(SRC_DIR, "oral.json")), ensure_ascii=False))
     out.append("")
     return "\n".join(out)
@@ -91,6 +123,39 @@ import { currentUser } from "../shared/session.js";
 let LIVE_ENV = {};
 let LIVE_CTX = null;
 let LIVE_USER = null;      // 本次请求的登录用户（用于计费）
+
+/** 兜底去重：同一段里出现高度重复的两句时，只保留第一句（字符二元组相似度 ≥0.62 视为重复） */
+function dedupeSentences(text) {
+  const src = String(text || "").trim();
+  if (!src) return src;
+  // 中英文句末标点都要分句（原写法漏了英文句点，导致英文重复句永远去不掉）
+  const parts = src.split(/(?<=[。！？!?；;\.\n])/).map((x) => x.trim()).filter(Boolean);
+  if (parts.length < 2) return src;
+  const grams = (t) => {
+    const clean = t.replace(/[\s，。！？、；：""''（）()\[\]【】·…—]/g, "");
+    const set = new Set();
+    for (let i = 0; i < clean.length - 1; i += 1) set.add(clean.slice(i, i + 2));
+    return set;
+  };
+  const kept = [];
+  const keptGrams = [];
+  for (const p of parts) {
+    const g = grams(p);
+    if (g.size >= 5) {   // 太短的句子不去重（可能是正常的重复强调）
+      let dup = false;
+      for (const kg of keptGrams) {
+        let inter = 0;
+        for (const x of g) if (kg.has(x)) inter += 1;
+        const sim = inter / (g.size + kg.size - inter);
+        if (sim >= 0.45) { dup = true; break; }
+      }
+      if (dup) continue;
+    }
+    kept.push(p);
+    keptGrams.push(g);
+  }
+  return kept.join("");
+}
 
 /** 同传计费：累计音频秒数，每满 60 秒扣 1 页额度（写进账户系统的 usage 表） */
 async function meterLive(env, userId, seconds) {

@@ -11,6 +11,39 @@ let LIVE_ENV = {};
 let LIVE_CTX = null;
 let LIVE_USER = null;      // 本次请求的登录用户（用于计费）
 
+/** 兜底去重：同一段里出现高度重复的两句时，只保留第一句（字符二元组相似度 ≥0.62 视为重复） */
+function dedupeSentences(text) {
+  const src = String(text || "").trim();
+  if (!src) return src;
+  // 中英文句末标点都要分句（原写法漏了英文句点，导致英文重复句永远去不掉）
+  const parts = src.split(/(?<=[。！？!?；;\.\n])/).map((x) => x.trim()).filter(Boolean);
+  if (parts.length < 2) return src;
+  const grams = (t) => {
+    const clean = t.replace(/[\s，。！？、；：""''（）()\[\]【】·…—]/g, "");
+    const set = new Set();
+    for (let i = 0; i < clean.length - 1; i += 1) set.add(clean.slice(i, i + 2));
+    return set;
+  };
+  const kept = [];
+  const keptGrams = [];
+  for (const p of parts) {
+    const g = grams(p);
+    if (g.size >= 5) {   // 太短的句子不去重（可能是正常的重复强调）
+      let dup = false;
+      for (const kg of keptGrams) {
+        let inter = 0;
+        for (const x of g) if (kg.has(x)) inter += 1;
+        const sim = inter / (g.size + kg.size - inter);
+        if (sim >= 0.45) { dup = true; break; }
+      }
+      if (dup) continue;
+    }
+    kept.push(p);
+    keptGrams.push(g);
+  }
+  return kept.join("");
+}
+
 /** 同传计费：累计音频秒数，每满 60 秒扣 1 页额度（写进账户系统的 usage 表） */
 async function meterLive(env, userId, seconds) {
   const now = Math.floor(Date.now() / 1000);
