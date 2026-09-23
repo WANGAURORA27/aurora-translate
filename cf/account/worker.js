@@ -24,7 +24,9 @@ const SESSION_TTL = 30 * 24 * 3600; // 30 天
 const CODE_TTL = 10 * 60; // 验证码 10 分钟
 const PBKDF2_ITER = 100000;
 const MIN_PASSWORD = 8;
-const DEFAULT_QUOTA = 200; // 每月默认页数
+// 各角色的每月默认页数（管理员可在后台单独调整某个用户）
+const ROLE_QUOTA = { admin: 200, vip: 50, user: 30 };
+const DEFAULT_QUOTA = ROLE_QUOTA.user;
 
 // ── 小工具 ────────────────────────────────────────────────────────────
 
@@ -112,6 +114,34 @@ async function consumeCode(env, email, purpose, code) {
   if (!safeEqual(row.code_hash, await codeHash(env, email, purpose, code))) return "验证码不对";
   await env.DB.prepare("UPDATE codes SET used_at = ? WHERE id = ?").bind(now, row.id).run();
   return null;
+}
+
+// ── 邀请码 ────────────────────────────────────────────────────────────
+
+/** 生成一个不容易看错的邀请码：去掉 I O 0 1 */
+function newInviteCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const buf = new Uint8Array(8);
+  crypto.getRandomValues(buf);
+  let body = "";
+  for (const b of buf) body += chars[b % chars.length];
+  return "AURORA-" + body.slice(0, 4) + "-" + body.slice(4, 8);
+}
+
+/** 只检查不消费（先校验、再消费，避免把验证码白白用掉） */
+async function checkInvite(env, code) {
+  const now = Math.floor(Date.now() / 1000);
+  const row = await env.DB.prepare(
+    "SELECT code, max_uses, used_count, expires_at FROM invites WHERE code = ?",
+  ).bind(code).first();
+  if (!row) return "邀请码不存在";
+  if (row.expires_at && row.expires_at < now) return "邀请码已过期";
+  if (row.used_count >= row.max_uses) return "邀请码已被用完";
+  return null;
+}
+
+async function consumeInvite(env, code) {
+  await env.DB.prepare("UPDATE invites SET used_count = used_count + 1 WHERE code = ?").bind(code).run();
 }
 
 // ── 限流（KV 计数器，按邮箱与 IP 双维度）────────────────────────────────
@@ -251,22 +281,40 @@ async function apiRegister(request, env, url) {
   const exists = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
   if (exists) return fail("这个邮箱已经注册过了");
 
-  const codeErr = await consumeCode(env, email, "register", code);
-  if (codeErr) return fail(codeErr);
-
   const now = Math.floor(Date.now() / 1000);
   const isFirst = !(await env.DB.prepare("SELECT id FROM users LIMIT 1").first());
+
+  // 邀请码：填了就是 VIP；站点主人也可以用 REQUIRE_INVITE=1 把它变成"口令"（必填才能注册）
+  const invite = String(body.invite || "").trim().toUpperCase();
+  let role = isFirst ? "admin" : "user";
+  if (!isFirst) {
+    if (invite) {
+      const inviteErr = await checkInvite(env, invite);
+      if (inviteErr) return fail(inviteErr);
+      role = "vip";
+    } else if (env.REQUIRE_INVITE === "1") {
+      return fail("本站需要邀请码才能注册，请向站点主人索取");
+    }
+  }
+
+  const codeErr = await consumeCode(env, email, "register", code);
+  if (codeErr) return fail(codeErr);
+  if (!isFirst && invite) await consumeInvite(env, invite);
+
+  const quota = ROLE_QUOTA[role] || DEFAULT_QUOTA;
   const res = await env.DB.prepare(
     `INSERT INTO users (email, pass_hash, role, quota_pages, created_at, quota_reset_at)
      VALUES (?, ?, ?, ?, ?, ?)`,
-  ).bind(email, await hashPassword(password), isFirst ? "admin" : "user", DEFAULT_QUOTA, now, now).run();
+  ).bind(email, await hashPassword(password), role, quota, now, now).run();
 
   const userId = res.meta.last_row_id;
-  await audit(env, userId, userId, "register", email, request);
+  await audit(env, userId, userId, "register", email + (invite ? "（邀请码）" : ""), request);
   const token = await createSession(env, userId, request);
-  return json({ ok: true, user: { email, role: isFirst ? "admin" : "user" } }, 200, {
-    "set-cookie": sessionCookie(token, SESSION_TTL, env.COOKIE_DOMAIN),
-  });
+  return json({
+    ok: true,
+    user: { email, role },
+    message: role === "vip" ? `邀请码有效，已为你开通 VIP（每月 ${quota} 页）` : `注册成功（每月 ${quota} 页）`,
+  }, 200, { "set-cookie": sessionCookie(token, SESSION_TTL, env.COOKIE_DOMAIN) });
 }
 
 async function apiLogin(request, env, url) {
@@ -405,9 +453,14 @@ async function apiAdminUpdate(request, env) {
     sets.push("status = ?");
     vals.push(body.status);
   }
-  if (Number.isFinite(Number(body.quota_pages)) && Number(body.quota_pages) >= 0) {
+  const quotaGiven = Number.isFinite(Number(body.quota_pages)) && Number(body.quota_pages) >= 0;
+  if (quotaGiven) {
     sets.push("quota_pages = ?");
     vals.push(Number(body.quota_pages));
+  } else if (["user", "vip", "admin"].includes(body.role)) {
+    // 只改角色没给额度 → 自动套用该角色的默认额度（30 / 50 / 200）
+    sets.push("quota_pages = ?");
+    vals.push(ROLE_QUOTA[body.role]);
   }
   if (Number.isFinite(Number(body.reset_used)) && Number(body.reset_used) === 1) {
     sets.push("used_pages = 0");
@@ -421,6 +474,40 @@ async function apiAdminUpdate(request, env) {
   }
   await audit(env, actor.id, id, "admin-update", JSON.stringify(body).slice(0, 200), request);
   return ok({ message: "已更新" });
+}
+
+/** 管理员：生成邀请码 */
+async function apiAdminInvite(request, env) {
+  const actor = await currentUser(env, request);
+  if (!actor || actor.role !== "admin") return fail("需要管理员权限", 403);
+  const body = await readJson(request);
+  if (!body) return fail("请求格式不对");
+
+  const count = Math.min(Math.max(Number(body.count) || 1, 1), 20);
+  const maxUses = Math.min(Math.max(Number(body.max_uses) || 1, 1), 100);
+  const days = Math.min(Math.max(Number(body.days) || 30, 1), 3650);
+  const now = Math.floor(Date.now() / 1000);
+  const codes = [];
+  for (let i = 0; i < count; i += 1) {
+    const code = newInviteCode();
+    await env.DB.prepare(
+      "INSERT INTO invites (code, created_by, max_uses, used_count, expires_at, created_at) VALUES (?, ?, ?, 0, ?, ?)",
+    ).bind(code, actor.id, maxUses, now + days * 86400, now).run();
+    codes.push(code);
+  }
+  await audit(env, actor.id, null, "invite-create", `${count} 个 × ${maxUses} 次`, request);
+  return ok({ codes, max_uses: maxUses, days });
+}
+
+/** 管理员：邀请码列表 */
+async function apiAdminInvites(request, env) {
+  const actor = await currentUser(env, request);
+  if (!actor || actor.role !== "admin") return fail("需要管理员权限", 403);
+  const list = await env.DB.prepare(
+    `SELECT code, max_uses, used_count, expires_at, created_at FROM invites
+      ORDER BY created_at DESC, code DESC LIMIT 100`,
+  ).all();
+  return ok({ invites: list.results || [] });
 }
 
 // ── 入口 ──────────────────────────────────────────────────────────────
@@ -461,6 +548,8 @@ export default {
           case "/api/usage": return await apiUsage(request, env);
           case "/api/admin/users": return await apiAdminUsers(request, env);
           case "/api/admin/update": return await apiAdminUpdate(request, env);
+          case "/api/admin/invite": return await apiAdminInvite(request, env);
+          case "/api/admin/invites": return await apiAdminInvites(request, env);
           default: return fail("没有这个接口：" + path, 404);
         }
       }

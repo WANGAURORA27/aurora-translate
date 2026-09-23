@@ -80,6 +80,8 @@ export const PAGE = `<!DOCTYPE html>
       </div>
       <label>设置密码</label>
       <input id="rg-pass" type="password" autocomplete="new-password" placeholder="至少 8 位，建议 12 位以上">
+      <label>邀请码（选填）</label>
+      <input id="rg-invite" placeholder="有邀请码 → 自动成为 VIP（每月 50 页）">
       <div style="margin-top:18px"><button id="btn-register">注册并登录</button></div>
       <p class="msg" id="rg-msg"></p>
       <p class="muted" style="margin-top:12px">第一个注册的账号自动成为管理员。注册即表示同意：本站仅用于个人与朋友之间的文档翻译，请勿上传违法内容。</p>
@@ -145,8 +147,19 @@ export const PAGE = `<!DOCTYPE html>
         <thead><tr><th>邮箱</th><th>角色</th><th>额度</th><th>已用</th><th>操作</th></tr></thead>
         <tbody id="admin-body"></tbody>
       </table>
-      <p class="muted" style="margin-top:10px">点"改"可以调角色和额度；封号会把该用户所有会话踢下线。</p>
+      <p class="muted" style="margin-top:10px">点「改」可以调角色和额度（只改角色会自动套用该角色默认额度：普通 30 / VIP 50 / 管理员 200）；封号会把该用户所有会话踢下线。</p>
       <p class="msg" id="ad-msg"></p>
+    </div>
+
+    <div class="card hidden" id="invite-card">
+      <div style="font-weight:600;margin-bottom:6px">邀请码</div>
+      <p class="muted">把邀请码发给朋友，他注册时填上就自动成为 <b>VIP（每月 50 页）</b>；不填邀请码注册的是普通用户（每月 30 页）。</p>
+      <div style="margin-top:12px"><button id="btn-newinvite">生成邀请码</button></div>
+      <p class="msg" id="inv-msg"></p>
+      <table style="margin-top:12px">
+        <thead><tr><th>邀请码</th><th>已用 / 上限</th><th>有效期至</th><th></th></tr></thead>
+        <tbody id="invite-body"></tbody>
+      </table>
     </div>
   </div>
 </div>
@@ -227,11 +240,13 @@ $('btn-register').onclick = function () {
   setMsg('rg-msg', '');
   busy(btn, true, '注册中…');
   post('/api/register', {
-    email: $('rg-email').value, code: $('rg-code').value, password: $('rg-pass').value
+    email: $('rg-email').value, code: $('rg-code').value,
+    password: $('rg-pass').value, invite: $('rg-invite').value
   }).then(function (d) {
     busy(btn, false);
     if (!d.ok) { setMsg('rg-msg', d.error || '注册失败', 'bad'); return; }
-    $('rg-pass').value = ''; $('rg-code').value = '';
+    $('rg-pass').value = ''; $('rg-code').value = ''; $('rg-invite').value = '';
+    if (d.message) setMsg('rg-msg', d.message, 'good');
     loadMe();
   }).catch(function () { busy(btn, false); setMsg('rg-msg', '网络错误', 'bad'); });
 };
@@ -295,8 +310,9 @@ function loadMe() {
     $('me-total').textContent = (d.usage_total.jobs || 0) + ' 个文件';
     $('me-created').textContent = fmtDate(d.user.created_at);
     show('admin-card', role === 'admin');
+    show('invite-card', role === 'admin');
     loadUsage();
-    if (role === 'admin') loadAdmin();
+    if (role === 'admin') { loadAdmin(); loadInvites(); }
   }).catch(function () {});
 }
 
@@ -341,6 +357,52 @@ function loadAdmin() {
             setMsg('ad-msg', r.ok ? '已更新 ' + u.email : (r.error || '失败'), r.ok ? 'good' : 'bad');
             loadAdmin();
           });
+      };
+      td.appendChild(b);
+      body.appendChild(tr);
+    });
+  }).catch(function () {});
+}
+
+/* ── 邀请码（管理员）── */
+$('btn-newinvite').onclick = function () {
+  var count = prompt('一次生成几个邀请码？', '3');
+  if (count === null) return;
+  var uses = prompt('每个邀请码可以用几次？', '1');
+  if (uses === null) return;
+  var days = prompt('有效期多少天？', '30');
+  if (days === null) return;
+  setMsg('inv-msg', '');
+  post('/api/admin/invite', { count: Number(count), max_uses: Number(uses), days: Number(days) })
+    .then(function (d) {
+      if (!d.ok) { setMsg('inv-msg', d.error || '生成失败', 'bad'); return; }
+      setMsg('inv-msg', '已生成（点一下即可复制）：' + d.codes.join('   '), 'good');
+      loadInvites();
+    }).catch(function () { setMsg('inv-msg', '网络错误', 'bad'); });
+};
+
+function loadInvites() {
+  get('/api/admin/invites').then(function (d) {
+    if (!d.ok) return;
+    var body = $('invite-body');
+    body.innerHTML = '';
+    if (!d.invites.length) {
+      body.innerHTML = '<tr><td colspan="4" class="muted">还没有邀请码，点上面的按钮生成</td></tr>';
+      return;
+    }
+    d.invites.forEach(function (it) {
+      var tr = document.createElement('tr');
+      var left = it.max_uses - it.used_count;
+      var exp = it.expires_at ? fmtDate(it.expires_at) : '长期';
+      tr.innerHTML = '<td><code>' + it.code + '</code></td><td>' + it.used_count + ' / ' + it.max_uses +
+        (left <= 0 ? ' <span class="pill admin">已用完</span>' : '') +
+        '</td><td>' + exp + '</td><td></td>';
+      var td = tr.lastChild;
+      var b = document.createElement('button');
+      b.className = 'ghost'; b.textContent = '复制'; b.style.padding = '4px 10px'; b.style.fontSize = '13px';
+      b.onclick = function () {
+        if (navigator.clipboard) navigator.clipboard.writeText(it.code);
+        b.textContent = '已复制'; setTimeout(function () { b.textContent = '复制'; }, 1200);
       };
       td.appendChild(b);
       body.appendChild(tr);
