@@ -1,0 +1,29 @@
+# Aurora 账户系统（阶段 1）· Cloudflare Worker + D1
+# 部署前跑 cf/deploy-account.sh 会自动把两个 id 填进来。
+
+name = "aurora-account"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[observability]
+enabled = true
+
+# 用户、会话、验证码、用量、审计都在这里（SQLite）
+[[d1_databases]]
+binding = "DB"
+database_name = "aurora-account"
+database_id = "REPLACE_WITH_D1_ID"
+
+# 限流计数器（发验证码、登录尝试）
+[[kv_namespaces]]
+binding = "LIMITS"
+id = "REPLACE_WITH_LIMITS_ID"
+
+[vars]
+MAIL_FROM = "Aurora <no-reply@ourmetaverse.cn>"
+# 设成 1 时，验证码会直接回给调用方（只用于本地开发，线上必须为 0）
+DEV_SHOW_CODE = "0"
+
+# 密钥用 wrangler secret put 写：
+#   SESSION_SECRET   验证码哈希的掺料（必须设置，随便一串长随机字符）
+#   RESEND_KEY       发信服务密钥（不设则无法发验证码邮件）

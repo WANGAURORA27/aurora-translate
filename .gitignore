@@ -19,3 +19,5 @@ cf/build/
 
 # wrangler dev 的本地产物（在仓库根目录跑时）
 .wrangler/
+cf/account/.dev.vars
+cf/account/.wrangler/

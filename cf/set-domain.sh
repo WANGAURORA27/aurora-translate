@@ -88,20 +88,21 @@ if ! printf '%s' "$RECS" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>
   warn "  绑定时若报「记录已存在」，请到面板 DNS 页面手动删掉 doc 那条，再重跑"
   : > /tmp/aurora_del.txt
 else
-printf '%s' "$RECS" | python3 - <<'PY' > /tmp/aurora_del.txt
-import json, sys
+printf '%s' "$RECS" | AURORA_HOST="$HOST" python3 - <<'PY' > /tmp/aurora_del.txt
+import json, os, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+want = os.environ.get("AURORA_HOST", "")
 for r in d.get("result") or []:
-    if r.get("type") == "A" and r.get("name") == "doc.ourmetaverse.cn":
+    if r.get("type") in ("A", "AAAA", "CNAME") and r.get("name") == want:
         print(r["id"], r.get("content"))
 PY
 fi
 if [ -s /tmp/aurora_del.txt ]; then
   while read -r rid content; do
-    echo "  删除 A 记录 doc.ourmetaverse.cn → $content"
+    echo "  删除旧记录 $HOST → $content"
     api DELETE "/zones/$ZONE_ID/dns_records/$rid" > /dev/null
   done < /tmp/aurora_del.txt
 else
