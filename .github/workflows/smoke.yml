@@ -64,7 +64,7 @@ jobs:
           echo "── 3. 上传样例并派活 ──"
           resp=$(curl -fsS --max-time 300 -X PUT "$WORKER/api/upload" \
             -H "x-password: $PW" -H 'x-filename: smoke-test.pdf' \
-            -H "x-mode: $MODE" -H 'x-target: 中文' \
+            -H "x-mode: $MODE" -H 'x-target: %E4%B8%AD%E6%96%87' \
             --data-binary @samples/demo.pdf)
           JOB=$(printf '%s' "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
           echo "  任务号 $JOB"

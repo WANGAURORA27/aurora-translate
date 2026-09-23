@@ -116,6 +116,13 @@ DEPLOY_LOG=$(wf deploy 2>&1) || true
 printf '%s\n' "$DEPLOY_LOG" | tail -8
 URL=$(printf '%s' "$DEPLOY_LOG" | grep -oE 'https://[a-z0-9.-]+\.workers\.dev' | head -1)
 [ -n "$URL" ] || die "没能从部署输出里认出网址，请手动看一眼上面的输出"
+# 如果已经绑过自己的域名（cf/set-domain.sh 会记下来），优先用它 ——
+# 因为 *.workers.dev 在国内打不开
+if [ -f "$SECRETS/custom_domain" ]; then
+  CUSTOM="https://$(tr -d ' \t\r\n' < "$SECRETS/custom_domain")"
+  echo "检测到自定义域名，WORKER_URL 用它：$CUSTOM"
+  URL="$CUSTOM"
+fi
 echo "网址：$URL"
 
 step "6/6 把网址与内部密钥同步给 GitHub Actions"

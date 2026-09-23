@@ -50,6 +50,19 @@ function jobKey(id) {
   return "job:" + id;
 }
 
+/**
+ * 请求头里的中文：网页端会 encodeURIComponent（HTTP 头只能是 ASCII），
+ * 命令行/curl 往往直接发原文。两种都得认 —— 解不开就按原样返回，绝不抛错。
+ */
+function decodeHeader(value, fallback = "") {
+  if (!value) return fallback;
+  try {
+    return decodeURIComponent(value);
+  } catch (err) {
+    return value;
+  }
+}
+
 function humanSize(bytes) {
   if (!bytes) return "0";
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
@@ -275,6 +288,16 @@ async function runFacts(env, runId) {
   return facts;
 }
 
+/** 这个机房现在能不能读到译文块（KV 跨机房会有延迟，读得到才算真的能下载） */
+async function resultVisible(env, id, chunks) {
+  if (storeKind(env) === "r2") {
+    return (await env.FILES.head("results/" + id + "/blob")) !== null;
+  }
+  if (!chunks) return false;
+  const first = await env.JOBS.get("blob:results:" + id + ":0", "arrayBuffer");
+  return !!first;
+}
+
 /** 译文块到底在不在（记录可能被搞乱，但数据不会骗人）——用于自愈与下载兜底 */
 async function resultChunkCount(env, id) {
   if (storeKind(env) === "r2") {
@@ -316,7 +339,7 @@ async function adoptRun(env, jobId) {
 function authorizeUser(request, env, url) {
   const given = request.headers.get("x-password") || url.searchParams.get("password") || "";
   if (!env.PASSWORD) return "服务端还没设置口令（PASSWORD）";
-  if (given !== env.PASSWORD) return "口令不对";
+  if (given !== env.PASSWORD && decodeHeader(given) !== env.PASSWORD) return "口令不对";
   return null;
 }
 
@@ -332,16 +355,16 @@ async function handleUpload(request, env, ctx) {
   const daren = authorizeUser(request, env, new URL(request.url));
   if (daren) return fail(daren, 401);
 
-  const name = decodeURIComponent(request.headers.get("x-filename") || "");
+  const name = decodeHeader(request.headers.get("x-filename"));
   if (!name) return fail("没收到文件名");
   const lower = name.toLowerCase();
   if (!lower.endsWith(".pdf") && !lower.endsWith(".docx") && !lower.endsWith(".doc")) {
     return fail("只支持 PDF 和 Word（.pdf / .docx）");
   }
 
-  const mode = request.headers.get("x-mode") || "inplace";
+  const mode = decodeHeader(request.headers.get("x-mode"), "inplace");
   if (!MODES.has(mode)) return fail("输出形式不对：" + mode);
-  const target = request.headers.get("x-target") || "中文";
+  const target = decodeHeader(request.headers.get("x-target"), "中文");
   if (!TARGETS.has(target)) return fail("目标语言不对：" + target);
 
   const declared = Number(request.headers.get("content-length") || 0);
@@ -459,6 +482,12 @@ async function handleStatus(request, env, url) {
       stepTotal = facts.stepTotal;
     }
   }
+  // ★ 别急着说"完成"：任务记录可能已经同步过来，但译文分块还在路上（KV 跨机房延迟）。
+  //   这里先探一下，这个机房读不到就继续显示"同步中"，免得用户点了下载却拿到报错。
+  if (status === "done" && !(await resultVisible(env, job.id, job.resultChunks))) {
+    status = "running";
+    phase = "译文正在同步（约 1 分钟）…";
+  }
   if (status === "done") phase = "翻译完成";
   else if (status === "failed") phase = phase || note || "翻译失败";
   else if (!phase) phase = status === "queued" ? "已排队，马上开始…" : "正在翻译…";
@@ -495,8 +524,17 @@ async function handleDownload(request, env, url) {
   job = await healJob(env, job);
   if (!job.resultChunks) return fail("译文还没好", 409);
 
-  const blob = await readBlob(env, id, "results", job.resultChunks);
-  if (!blob) return fail("译文已过期（原件与译文只保留 3 天）", 410);
+  let blob = await readBlob(env, id, "results", job.resultChunks);
+  // 跨机房同步有延迟：等最多 12 秒再下结论
+  for (let i = 0; i < 4 && !blob; i += 1) {
+    await new Promise((r) => setTimeout(r, 3000));
+    blob = await readBlob(env, id, "results", job.resultChunks);
+  }
+  if (!blob) {
+    const ageSec = (Date.now() - (job.createdAt || 0)) / 1000;
+    if (ageSec > BLOB_TTL) return fail("译文已过期（原件与译文只保留 3 天）", 410);
+    return fail("译文正在同步，请 10 秒后再点一次下载", 409);
+  }
   const filename = job.resultName || "translated.pdf";
   const ext = (filename.match(/\.[a-z0-9]+$/i) || [".pdf"])[0];
   const headers = {
@@ -536,7 +574,7 @@ async function handleResult(request, env) {
   if (!job) return fail("没有这个任务", 404);
   if (!request.body) return fail("没收到译文内容");
 
-  const resultName = decodeURIComponent(request.headers.get("x-filename") || job.name);
+  const resultName = decodeHeader(request.headers.get("x-filename"), job.name);
   let written;
   try {
     written = await putBlob(env, id, "results", request.body);
