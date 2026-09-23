@@ -1,0 +1,25 @@
+# LiveBridge 实时同声传译 · Cloudflare 版
+# 业务代码来自 live-interpreter/server.mjs，由 build.py 自动转换（见该文件头部说明）
+
+name = "aurora-live"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+# 原代码用了 Buffer（组装 JSON / 拼接音频），由 nodejs_compat 提供
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# 与账户站共用同一个 D1：校验登录会话（阶段：账号打通）
+[[d1_databases]]
+binding = "DB"
+database_name = "aurora-account"
+database_id = "90980376-a702-4617-a3c0-1fd2798e7179"
+
+[vars]
+# 演示模式：设成 "1" 时不需要任何 API 密钥即可跑通整条链路（模拟翻译 + 提示音）
+MOCK = "0"
+
+# 需要设置的密钥（wrangler secret put）：
+#   PROFILES_JSON  完整 profiles.json 内容（含各家 API 密钥，使用者只选代号）
+#   ADMIN_TOKEN    可选：管理页面 /api/usage 之类接口的口令
