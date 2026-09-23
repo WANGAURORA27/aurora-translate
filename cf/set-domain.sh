@@ -67,7 +67,8 @@ print(((d.get('result') or {}).get('status')) or '?')" 2>/dev/null || echo "?")
 fi
 
 printf '\n\033[1;34m== 2/5 检查 NS 是否已经切到 Cloudflare ==\033[0m\n'
-NS_NOW=$(dig +short NS "$ZONE" 2>/dev/null | tr '\n' ' ')
+NS_NOW=$(dig +short NS "$ZONE" @8.8.8.8 2>/dev/null | tr '\n' ' ')
+[ -n "$NS_NOW" ] || NS_NOW=$(dig +short NS "$ZONE" 2>/dev/null | tr '\n' ' ')
 echo "  当前 NS：${NS_NOW:-（查询失败）}"
 case "$NS_NOW" in
   *cloudflare.com*) ok "  已指向 Cloudflare ✓" ;;
@@ -82,13 +83,22 @@ fi
 
 printf '\n\033[1;34m== 3/5 清掉指向已下线服务器的旧记录 ==\033[0m\n'
 RECS=$(api GET "/zones/$ZONE_ID/dns_records?per_page=100")
+if ! printf '%s' "$RECS" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+  warn "  令牌没有 Zone:DNS:Edit 权限，跳过自动清理"
+  warn "  绑定时若报「记录已存在」，请到面板 DNS 页面手动删掉 doc 那条，再重跑"
+  : > /tmp/aurora_del.txt
+else
 printf '%s' "$RECS" | python3 - <<'PY' > /tmp/aurora_del.txt
 import json, sys
-d = json.load(sys.stdin)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
 for r in d.get("result") or []:
     if r.get("type") == "A" and r.get("name") == "doc.ourmetaverse.cn":
         print(r["id"], r.get("content"))
 PY
+fi
 if [ -s /tmp/aurora_del.txt ]; then
   while read -r rid content; do
     echo "  删除 A 记录 doc.ourmetaverse.cn → $content"
@@ -124,14 +134,21 @@ fi
 printf '\n\033[1;34m== 5/5 从本机实测能不能直连（关键一步）==\033[0m\n'
 sleep 20
 IPS=$(dig +short "$HOST" 2>/dev/null | tr '\n' ' ')
-echo "  解析到：${IPS:-（空）}"
-code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$HOST/" 2>/dev/null || echo 000)
+PUB=$(dig +short "$HOST" @1.1.1.1 2>/dev/null | grep -E '^[0-9.]+$' | head -1)
+echo "  本机解析到：${IPS:-（空，多半是本地缓存旧记录）}"
+echo "  公共 DNS 解析到：${PUB:-（空）}"
+if [ -n "$PUB" ]; then
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 --resolve "$HOST:443:$PUB" "https://$HOST/" 2>/dev/null || echo 000)
+else
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "https://$HOST/" 2>/dev/null || echo 000)
+fi
 echo "  HTTPS 请求：HTTP $code"
 if [ "$code" = "200" ]; then
   ok "  ✓ 本机能直连！国内可用（无需代理）"
 else
   warn "  直连失败（HTTP ${code}）。看握手细节："
-  curl -sv --max-time 15 -o /dev/null "https://$HOST/" 2>&1 | \
+  EXTRA=""; [ -n "$PUB" ] && EXTRA="--resolve $HOST:443:$PUB"
+  curl -sv --max-time 15 -o /dev/null $EXTRA "https://$HOST/" 2>&1 | \
     grep -E "Trying|Connected|TLS|SSL|Recv failure|reset|HTTP/" | head -6 | sed 's/^/    /'
   warn "  若出现 'Recv failure: Connection reset by peer'，说明 Cloudflare 这批 IP 也被 SNI 阻断。"
 fi

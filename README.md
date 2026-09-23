@@ -35,15 +35,16 @@
 
 另外有一个网页入口，适合传**大文件**、或不想碰 GitHub 的人：
 
-**<https://aurora-translate.wangaurora27.workers.dev>** —— 打开后输入站点主人给的口令即可。
+**<https://doc.ourmetaverse.cn>** —— 打开后输入站点主人给的口令即可。**国内可直接访问，不用代理。**
 
 - 单个文件上限 **95MB**（Issue 附件只有 25MB），原件与译文保留 3 天
 - 页面上直接看进度、点一下下载，不用去 GitHub 翻
 - 翻译仍然跑在 GitHub Actions 里，你的 API 密钥只存在本仓库 Secret，不经过 Cloudflare
 - 源码在 [`cf/`](cf/)，自己 fork 后 `bash cf/deploy.sh` 就能部署一份，**不需要绑银行卡**
 
-> ⚠️ **国内网络提醒**：`*.workers.dev` 被 DNS 污染并阻断 TLS 握手，**国内直连打不开**（需代理）。
-> 国内用上面的 **Issue 那条路**最稳：github.com 能访问，代价是附件上限 25MB。
+> 说明：Cloudflare 自带的 `*.workers.dev` 域名在国内被 DNS 污染 + 阻断 TLS 握手，用不了；
+> 换成自己的域名 `doc.ourmetaverse.cn`（域名解析交给 Cloudflare）之后，**国内实测可直连**。
+> 另外 Issue 那条路也一直可用（附件上限 25MB）。
 
 ## 配置密钥（一次性）
 

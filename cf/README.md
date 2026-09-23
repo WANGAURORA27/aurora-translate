@@ -91,6 +91,28 @@ bash cf/deploy.sh
 → 部署 → 把网址和内部密钥同步给 GitHub（`WORKER_URL` 变量、`AGENT_KEY` 密钥），
 最后打印网址与口令。**全程不需要绑卡**。重复跑是安全的，已存在的资源会跳过。
 
+## 二·五、绑到自己的域名（国内可直连的关键）
+
+`*.workers.dev` 这个自带域名在**国内被 DNS 污染并阻断 TLS 握手**，直连打不开。
+解决办法是把自己的域名解析交给 Cloudflare，再把域名绑到 Worker：
+
+1. Cloudflare 面板 → **Domains → Onboard a domain** → 输入顶级域名（如 `ourmetaverse.cn`）
+   → 选 Free 计划 → 记下它给的两个 nameserver
+2. 到域名注册商（阿里云）改 NS 为那两个地址（阿里云：域名 → 管理 → **DNS 修改**）
+3. 等 NS 生效（一般几分钟到几小时；Cloudflare 面板显示 **active** 即成功）
+4. 绑定：
+
+```bash
+bash cf/set-domain.sh            # 默认绑 doc.ourmetaverse.cn
+bash cf/set-domain.sh 别的子域名.你的域名
+```
+
+脚本会：清掉指向旧服务器的记录 → 把域名绑到 Worker → **从本机实测能不能直连**。
+实测有效：绑上自定义域名后，国内直连首页 0.7 秒、45MB 文件上传 32 秒。
+
+> 令牌需要 `Zone:Zone:Edit` + `Zone:DNS:Edit` 才能自动清记录；没有也能绑定，
+> 只是要自己在面板里把同名记录删掉。
+
 ## 三、手动部署（脚本不好使时）
 
 ```bash
