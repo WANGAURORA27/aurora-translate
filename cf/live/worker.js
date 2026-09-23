@@ -9,6 +9,28 @@ import { currentUser } from "../shared/session.js";
 /** 每次请求开始前由 fetch 入口填进来（Worker 没有全局 env） */
 let LIVE_ENV = {};
 let LIVE_CTX = null;
+let LIVE_USER = null;      // 本次请求的登录用户（用于计费）
+
+/** 同传计费：累计音频秒数，每满 60 秒扣 1 页额度（写进账户系统的 usage 表） */
+async function meterLive(env, userId, seconds) {
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    `INSERT INTO live_meter (user_id, seconds, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET seconds = seconds + ?, updated_at = ?`,
+  ).bind(userId, seconds, now, seconds, now).run();
+  const row = await env.DB.prepare("SELECT seconds FROM live_meter WHERE user_id = ?").bind(userId).first();
+  const total = Number((row && row.seconds) || 0);
+  const minutes = Math.floor(total / 60);
+  if (minutes >= 1) {
+    await env.DB.prepare("UPDATE live_meter SET seconds = seconds - ? WHERE user_id = ?")
+      .bind(minutes * 60, userId).run();
+    await env.DB.prepare(
+      `INSERT INTO usage (user_id, kind, pages, note, created_at) VALUES (?, 'live', ?, ?, ?)`,
+    ).bind(userId, minutes, "同声传译 " + minutes + " 分钟", now).run();
+    await env.DB.prepare("UPDATE users SET used_pages = used_pages + ? WHERE id = ?")
+      .bind(minutes, userId).run();
+  }
+}
 const PE = (name, dflt = "") => (LIVE_ENV && LIVE_ENV[name] !== undefined ? LIVE_ENV[name] : dflt);
 
 /** 让原代码里的 existsSync/readFileSync/writeFileSync 继续可用：
@@ -1325,6 +1347,7 @@ export default {
   async fetch(request, env, ctx) {
     LIVE_ENV = env || {};
     LIVE_CTX = ctx || null;
+    LIVE_USER = null;
 
     let url;
     try { url = new URL(request.url); } catch (e) { return new Response("bad url", { status: 400 }); }
@@ -1334,6 +1357,7 @@ export default {
         && url.pathname !== "/api/health" && url.pathname !== "/api/healthz" && url.pathname !== "/api/me") {
       let who = null;
       try { who = env.DB ? await currentUser(env, request) : null; } catch (e) { who = null; }
+      LIVE_USER = who;
       if (!who) {
         return new Response(JSON.stringify({
           error: "请先登录后再使用同声传译：https://account.ourmetaverse.cn （注册只要一个邮箱收验证码）",
@@ -1355,6 +1379,11 @@ export default {
         : { ok: true, logged_in: false }), { headers: { "content-type": "application/json; charset=utf-8" } });
     }
 
+    // 同传计费：STT 上传的音频按秒累计，每满 60 秒扣 1 页额度
+    const meterStt = url.pathname === "/api/stt" && request.method === "POST";
+    let audioBytes = 0;
+    if (meterStt) audioBytes = Number(request.headers.get("content-length") || 0);
+
     const wantsStream = url.pathname === "/api/translate" && request.method === "POST" && url.searchParams.get("final") !== "1";
     const { res, stream } = makeRes(wantsStream);
     const req = makeReq(request, url);
@@ -1366,6 +1395,14 @@ export default {
       return new Response(JSON.stringify({ error: String((err && err.message) || err) }), {
         status: 500, headers: { "content-type": "application/json" },
       });
+    }
+
+    // 计费（只在接口成功时）：把本次音频秒数累加进 D1，满一分钟才扣 1 页
+    if (meterStt && res._status >= 200 && res._status < 300 && audioBytes > 0 && LIVE_USER && env.DB) {
+      try {
+        const secs = estAudioSeconds(audioBytes, request.headers.get("content-type") || "");
+        if (secs > 0) await meterLive(env, LIVE_USER.id, secs);
+      } catch (e) { /* 计费失败不影响翻译 */ }
     }
 
     const outHeaders = new Headers();
