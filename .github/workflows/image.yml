@@ -93,10 +93,17 @@ jobs:
             tesseract --list-langs
             tesseract --list-langs 2>&1 | grep -qx eng
             tesseract --list-langs 2>&1 | grep -qx chi_sim
-            test -f /usr/share/fonts/truetype/arphic/uming.ttc
             python -c "import fitz, docx, lxml, flask, waitress; print(\"deps ok\")"
             git --version
             gh --version | head -1
+            echo "── 字体文件（真实存在才打印到这里）──"
+            ls -l /usr/share/fonts/truetype/arphic/
+            ls -l /usr/share/fonts/truetype/wqy/
+            ls -l /usr/share/fonts/truetype/droid/
+            ls -l /usr/share/fonts/truetype/liberation/
+            ls -l /usr/share/fonts/truetype/dejavu/
+            echo "── 全部 TTF/TTC ──"
+            find /usr/share/fonts -type f \( -name "*.ttc" -o -name "*.ttf" \) | sort
           '
 
       - name: 记录 digest

@@ -109,7 +109,20 @@ jobs:
           [ "${saw_phase:-0}" = "1" ] || echo "::warning::整个过程中没看到阶段文字（phase）为空"
 
           echo "── 5. 下载译文并检查 ──"
-          curl -fsS --max-time 600 -o out.bin "$WORKER/api/download?id=$JOB&password=$PW"
+          # 任务记录已经 done，不代表译文块已经跨机房同步到位：Worker 的 /api/download
+          # 这时返回 409（"译文正在同步，请 10 秒后再点一次下载"）。以前这里只下一次，
+          # 撞上就整个自检变红 —— 实测踩到过（run 36554185773），历史上也红过两次。
+          # 只在 409 上重试，其它状态码立刻失败，免得把真问题掩盖成"等一等就好了"。
+          dl=0
+          for i in $(seq 1 8); do
+            code=$(curl -sS --max-time 600 -o out.bin -w '%{http_code}' \
+                     "$WORKER/api/download?id=$JOB&password=$PW") || true
+            if [ "$code" = "200" ]; then dl=1; break; fi
+            [ "$code" = "409" ] || { echo "::error::下载失败：HTTP ${code:-（curl 没返回状态码）}"; exit 1; }
+            echo "  第 $i 次还是 409（译文还没同步过来），等 10 秒再试…"
+            sleep 10
+          done
+          [ "$dl" = "1" ] || { echo "::error::下载一直 409，译文迟迟没同步过来"; exit 1; }
           ls -l out.bin
           # pymupdf 已经在运行环境镜像里，这里不用再 pip install（原来是每次现装）。
           # 真缺了的话下面 import fitz 会立刻报错，不会静默跳过校验。

@@ -36,6 +36,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ── 1. 系统依赖：OCR 引擎 + 中文字体 + git/curl（一次性装完就清 apt 列表）──
 # 字体说明见 pipelines/fonts.py：uming.ttc 必须存在，否则 PyMuPDF 会退回内置
 # china-s（译文复制出来是乱码）或 Noto CJK（整份 20MB 字体嵌进每页）。
+#
+# 字体为什么要装这么多：线上出现过某份 PDF 因为字体问题直接崩（日志里
+# `warning: unhandled font type` → `insert_font` 取不到字宽 → `NoneType.m_internal`）。
+# 候选清单里多放几个真实存在的字体文件，就多几条退路。
+#
+# ⚠️ 全部选 **TrueType / TTC** 轮廓，**不要**换成 fonts-noto-cjk：
+#    它是 CFF/OTF 轮廓，PyMuPDF 的 subset_fonts() 子集化会失败
+#    （"Reserved charstring byte"），结果是整份 ~20MB 字体嵌进每一页。
+#    实测同一份样例：Noto Serif CJK → 19.6MB，uming → 61KB。
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -44,6 +53,11 @@ RUN set -eux; \
         tesseract-ocr-chi-sim \
         tesseract-ocr-osd \
         fonts-arphic-uming \
+        fonts-arphic-ukai \
+        fonts-wqy-zenhei \
+        fonts-wqy-microhei \
+        fonts-droid-fallback \
+        fonts-liberation \
         fonts-dejavu-core \
         git \
         curl \
@@ -78,10 +92,21 @@ RUN set -eux; \
 RUN git config --system --add safe.directory '*'
 
 # ── 5. 构建期自检：装漏了就在这里让构建失败，而不是等线上任务跑一半才炸 ──
+# 字体部分既做断言、也把真实文件清单打进构建日志（有人要在代码里写候选路径时
+# 直接照着日志抄，不用猜）。
 RUN set -eux; \
     tesseract --version | head -1; \
     tesseract --list-langs; \
     tesseract --list-langs 2>&1 | grep -qx eng; \
     tesseract --list-langs 2>&1 | grep -qx chi_sim; \
     test -f /usr/share/fonts/truetype/arphic/uming.ttc; \
+    test -f /usr/share/fonts/truetype/arphic/ukai.ttc; \
+    test -f /usr/share/fonts/truetype/wqy/wqy-zenhei.ttc; \
+    test -f /usr/share/fonts/truetype/wqy/wqy-microhei.ttc; \
+    ls -l /usr/share/fonts/truetype/arphic/; \
+    ls -l /usr/share/fonts/truetype/wqy/; \
+    ls -l /usr/share/fonts/truetype/droid/; \
+    ls -l /usr/share/fonts/truetype/liberation/; \
+    ls -l /usr/share/fonts/truetype/dejavu/; \
+    find /usr/share/fonts -type f \( -name '*.ttc' -o -name '*.ttf' \) | sort; \
     python -c "import fitz, docx, lxml, flask, waitress; print('python deps ok')"
