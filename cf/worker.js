@@ -593,8 +593,14 @@ async function handleStatus(request, env, url) {
   // ★ 别急着说"完成"：任务记录可能已经同步过来，但译文分块还在路上（KV 跨机房延迟）。
   //   这里先探一下，这个机房读不到就继续显示"同步中"，免得用户点了下载却拿到报错。
   if (status === "done" && !(await resultVisible(env, job.id, job.resultChunks))) {
-    status = "running";
-    phase = "译文正在同步（约 1 分钟）…";
+    // ★ 必须有上限：resultChunks 缺失（老记录/记录被写坏）时 resultVisible 恒为 false，
+    //   而任务其实早就完成了 —— 会永远显示"正在同步"，线上真卡过一次 15 分钟。
+    //   完成超过 2 分钟还看不到块，就照实报完成，让用户去点下载（下载端自己会等/会报错）。
+    const doneAt = Number(job.doneAt || job.createdAt || 0);
+    if (!doneAt || Date.now() - doneAt < 120000) {
+      status = "running";
+      phase = "译文正在同步（约 1 分钟）…";
+    }
   }
   if (status === "done") phase = "翻译完成";
   else if (status === "failed") phase = phase || note || "翻译失败";
