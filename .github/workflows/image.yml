@@ -1,0 +1,106 @@
+name: 构建运行环境镜像
+
+# 把 translate.yml / smoke.yml 里那套"系统依赖 + Python 依赖"固化成一个镜像推到 GHCR，
+# 之后每个 job 只花一次 docker pull 的时间，省掉每次都重装的 20~30 秒。
+#
+# 镜像名：ghcr.io/wangaurora27/aurora-translate-runner:latest
+#        ghcr.io/wangaurora27/aurora-translate-runner:sha-<commit>
+# （GHCR 要求仓库名全小写，所以是 wangaurora27 而不是 WANGAURORA27）
+#
+# 什么时候会重建：
+#   * 手动点 Run workflow（workflow_dispatch）
+#   * push 到 main 且改动了 Dockerfile / requirements.txt / 本文件
+#
+# 注意：改了 .github/workflows/translate.yml 或 smoke.yml **不会**触发重建
+# （它们不参与镜像内容），这是故意的，避免无谓构建。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - requirements.txt
+      - .github/workflows/image.yml
+
+permissions:
+  contents: read
+  packages: write          # 允许用 GITHUB_TOKEN 推 GHCR
+
+env:
+  IMAGE: ghcr.io/wangaurora27/aurora-translate-runner
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # 关掉 provenance/sbom：它们会把推送的 tag 变成 OCI index（多一层 manifest），
+          # 既让体积统计变麻烦，也让 `docker pull <tag>` 在某些老工具上不好使。
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+
+      - name: 量体积（拉回来量，给的是解压后占用）
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE:latest"
+          bytes=$(docker image inspect "$IMAGE:latest" --format '{{.Size}}')
+          python3 - "$bytes" <<'PY'
+          import sys
+          b = int(sys.argv[1])
+          print("镜像解压后体积：%.1f MB（%d 字节）" % (b / 1048576, b))
+          with open("/tmp/size.txt", "w") as fh:
+              fh.write("%.1f" % (b / 1048576))
+          PY
+          {
+            echo "## 运行环境镜像"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 镜像 | \`$IMAGE:latest\` |"
+            echo "| commit tag | \`sha-${{ github.sha }}\` |"
+            echo "| 解压后体积 | $(cat /tmp/size.txt) MB |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 真跑一遍镜像里的依赖（装漏了这里就红）
+        run: |
+          set -euo pipefail
+          docker run --rm "$IMAGE:latest" bash -c '
+            set -euo pipefail
+            tesseract --version | head -1
+            tesseract --list-langs
+            tesseract --list-langs 2>&1 | grep -qx eng
+            tesseract --list-langs 2>&1 | grep -qx chi_sim
+            test -f /usr/share/fonts/truetype/arphic/uming.ttc
+            python -c "import fitz, docx, lxml, flask, waitress; print(\"deps ok\")"
+            git --version
+            gh --version | head -1
+          '
+
+      - name: 记录 digest
+        run: |
+          set -euo pipefail
+          echo "latest digest: ${{ steps.build.outputs.digest }}"
+          docker buildx imagetools inspect "$IMAGE:sha-${{ github.sha }}" | head -5 || true

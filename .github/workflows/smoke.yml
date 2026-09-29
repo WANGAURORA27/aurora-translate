@@ -23,18 +23,38 @@ on:
 
 permissions:
   contents: read
+  packages: read                # 从 GHCR 拉运行环境镜像
+
+# 容器 job 的默认 shell 是 sh（dash 不支持 `set -o pipefail`），自检脚本里用到了，
+# 所以显式切回 bash。
+defaults:
+  run:
+    shell: bash
 
 jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    container:
+      image: ghcr.io/wangaurora27/aurora-translate-runner:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
+      # 原来这里有 actions/setup-python@v5；换成容器后必须删掉（工具缓存里的那份
+      # python 会抢到 PATH 前面，看不到镜像里装的 pymupdf）。
+      - name: 环境自检（依赖来自镜像）
+        run: |
+          set -euo pipefail
+          echo "运行在容器镜像里："
+          tesseract --version | head -1
+          python -c "import fitz, docx; print('deps ok · pymupdf', fitz.__version__)"
+          curl --version | head -1
+          echo "自检通过 ✓"
 
       - name: 全链路自检
         env:
@@ -91,7 +111,8 @@ jobs:
           echo "── 5. 下载译文并检查 ──"
           curl -fsS --max-time 600 -o out.bin "$WORKER/api/download?id=$JOB&password=$PW"
           ls -l out.bin
-          pip install -q pymupdf
+          # pymupdf 已经在运行环境镜像里，这里不用再 pip install（原来是每次现装）。
+          # 真缺了的话下面 import fitz 会立刻报错，不会静默跳过校验。
           python3 - <<'PY'
           import json, re, sys
           import fitz

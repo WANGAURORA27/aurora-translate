@@ -48,6 +48,14 @@ on:
 permissions:
   contents: write               # 把译文推到 results 分支
   issues: write                 # 在 Issue 下评论、打标签
+  packages: read                # 从 GHCR 拉运行环境镜像（省略就变成 none，拉取会 403）
+
+# 两个 job 都跑在容器里，而**容器 job 的默认 shell 是 sh**（python:3.10-slim 里
+# /bin/sh 指向 dash，不支持 `set -o pipefail`），各步骤脚本里全是 `set -euo pipefail`，
+# 所以这里显式切回 bash（镜像里的 Debian 自带 bash）。
+defaults:
+  run:
+    shell: bash
 
 # 同一个 Issue 只跑一个任务；不同 Issue 可以并行
 concurrency:
@@ -64,6 +72,14 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.job_id == '')
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
+    # 运行环境（tesseract + 中文字体 + Python 依赖 + git/curl/gh）全部预装在镜像里，
+    # 每个 job 只花一次 docker pull 的时间，省掉原来那两步重装。
+    container:
+      image: ghcr.io/wangaurora27/aurora-translate-runner:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
       # ── 1. 身份校验：公开仓库任何人都能开 Issue，这里把住"谁能用我的密钥" ──
@@ -156,25 +172,28 @@ jobs:
       - uses: actions/checkout@v4
         if: steps.gate.outputs.ok == '1'
 
-      - uses: actions/setup-python@v5
-        if: steps.gate.outputs.ok == '1'
-        with:
-          python-version: "3.10"
-          cache: pip
+      # 这里原来有 actions/setup-python@v5（python 3.10 + cache: pip）。
+      # 换成容器后必须删掉：setup-python 会把工具缓存里的另一份 python 挂进容器并
+      # 抢到 PATH 前面，那份 python 看不到镜像里 pip 装的包，`import fitz` 会直接
+      # ModuleNotFoundError。镜像本身就是 python:3.10-slim，不需要它。
 
-      # ── 2. 装系统依赖：OCR 引擎与中文字体（PDF 翻译与扫描件都要用）──
-      - name: 安装系统依赖
+      # ── 2. 环境自检：依赖已经烤进镜像，这里只确认"镜像里没装漏" ──
+      # 故意一项一项查并且立刻 exit 1：缺任何一个包都要在这里就暴露，
+      # 而不是等翻译跑到一半（甚至跑到绘图那一步）才炸。
+      - name: 环境自检（依赖来自镜像）
         if: steps.gate.outputs.ok == '1'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
-               fonts-arphic-uming fonts-dejavu-core
-
-      - name: 安装 Python 依赖
-        if: steps.gate.outputs.ok == '1'
-        run: |
-          python -m pip install -q --upgrade pip
-          pip install -q -r requirements.txt
+          set -euo pipefail
+          echo "运行在容器镜像里，不再安装依赖，直接自检："
+          tesseract --version | head -1
+          echo "语言包：$(tesseract --list-langs 2>&1 | tr '\n' ' ')"
+          tesseract --list-langs 2>&1 | grep -qx eng     || { echo "::error::镜像缺 tesseract 英文语言包"; exit 1; }
+          tesseract --list-langs 2>&1 | grep -qx chi_sim || { echo "::error::镜像缺 tesseract 中文语言包"; exit 1; }
+          [ -f /usr/share/fonts/truetype/arphic/uming.ttc ] || { echo "::error::镜像缺中文字体 uming.ttc（译文会变乱码或撑大文件）"; exit 1; }
+          python -c "import fitz, docx, lxml, flask, waitress; print('deps ok · pymupdf', fitz.__version__)"
+          git --version
+          gh --version | head -1
+          echo "自检通过 ✓"
 
       - name: 下载待翻译文件
         if: steps.gate.outputs.ok == '1'
@@ -295,24 +314,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
+    # 与 translate 同一个运行环境镜像，见上面 job 里的说明。
+    container:
+      image: ghcr.io/wangaurora27/aurora-translate-runner:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-          cache: pip
+      # 原因同 translate job：容器里不能再挂 actions/setup-python。
 
-      - name: 安装系统依赖
+      # 与 translate job 同一份自检：镜像缺东西必须在这里立刻红。
+      - name: 环境自检（依赖来自镜像）
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
-               fonts-arphic-uming fonts-dejavu-core
-
-      - name: 安装 Python 依赖
-        run: |
-          python -m pip install -q --upgrade pip
-          pip install -q -r requirements.txt
+          set -euo pipefail
+          echo "运行在容器镜像里，不再安装依赖，直接自检："
+          tesseract --version | head -1
+          echo "语言包：$(tesseract --list-langs 2>&1 | tr '\n' ' ')"
+          tesseract --list-langs 2>&1 | grep -qx eng     || { echo "::error::镜像缺 tesseract 英文语言包"; exit 1; }
+          tesseract --list-langs 2>&1 | grep -qx chi_sim || { echo "::error::镜像缺 tesseract 中文语言包"; exit 1; }
+          [ -f /usr/share/fonts/truetype/arphic/uming.ttc ] || { echo "::error::镜像缺中文字体 uming.ttc（译文会变乱码或撑大文件）"; exit 1; }
+          python -c "import fitz, docx, lxml, flask, waitress; print('deps ok · pymupdf', fitz.__version__)"
+          echo "自检通过 ✓"
 
       - name: 从网页端取原件
         id: fetch
