@@ -629,6 +629,25 @@ async function handleStatus(request, env, url) {
   });
 }
 
+/**
+ * 把存储里的一条流转成"浏览器下载"响应。
+ * 文件名走 RFC 5987（filename*）带 UTF-8，中文名才不会变成乱码；
+ * 另外给一个纯 ASCII 的 filename= 兜底（老浏览器只认它）。
+ * fallback 是兜底名（译文用 translated、原件用 original），ext 跟真实文件走。
+ */
+function downloadResponse(blob, filename, fallback = "translated", size = null) {
+  const ext = (filename.match(/\.[a-z0-9]+$/i) || [".pdf"])[0];
+  const headers = {
+    "content-type": "application/octet-stream",
+    "content-disposition":
+      'attachment; filename="' + fallback + ext + "\"; filename*=UTF-8''" + encodeURIComponent(filename),
+    "cache-control": "no-store",
+  };
+  const len = size || blob.size;
+  if (len) headers["content-length"] = String(len);
+  return new Response(blob.stream, { headers });
+}
+
 async function handleDownload(request, env, url) {
   // skipQuota：下载已经译好的成品不再消耗额度，别让"额度用完了"拦着人取自己的文件
   const auth = await authorizeUser(request, env, url, { skipQuota: true });
@@ -653,17 +672,44 @@ async function handleDownload(request, env, url) {
     if (ageSec > BLOB_TTL) return fail("译文已过期（原件与译文只保留 3 天）", 410);
     return fail("译文正在同步，请 10 秒后再点一次下载", 409);
   }
-  const filename = job.resultName || "translated.pdf";
-  const ext = (filename.match(/\.[a-z0-9]+$/i) || [".pdf"])[0];
-  const headers = {
-    "content-type": "application/octet-stream",
-    "content-disposition":
-      'attachment; filename="translated' + ext + "\"; filename*=UTF-8''" + encodeURIComponent(filename),
-    "cache-control": "no-store",
-  };
-  const size = blob.size || job.resultSize;
-  if (size) headers["content-length"] = String(size);
-  return new Response(blob.stream, { headers });
+  return downloadResponse(blob, job.resultName || "translated.pdf", "translated", blob.size || job.resultSize);
+}
+
+/**
+ * 下载原件（用户上传的源文件）。
+ *
+ * ★ 访问策略（写清楚，方便以后收紧）：
+ *   本人随便下 —— 那就是他自己传的；
+ *   VIP / 管理员可以下**别人**的原件 —— 与公共文件区的成品同一档权限。
+ *   换句话说：凡是被列进公共文件区的文件，VIP 起连它的**原件**也拿得到。
+ *   这是产品明确要的（"能不能下载原件"），但它比"只下成品"敏感，将来若要收紧成
+ *   "只有管理员能下别人的原件"，改这一处的 canReadOthers 判断即可。
+ *
+ * ★ 原件与译文一样只留 3 天（BLOB_TTL），所以块不在时要说清是"同步中"还是"过期了"，
+ *   不能因为读不到块就回 403 —— 那会把"文件没了"伪装成"你没权限"。
+ */
+async function handleOriginal(request, env, url) {
+  const auth = await authorizeUser(request, env, url, { skipQuota: true });
+  if (auth.error) return fail(auth.error, 401);
+  const id = url.searchParams.get("id");
+  if (!id) return fail("缺少 id");
+  const job = await readJob(env, id);
+  if (!job) return fail("没有这个任务", 404);
+  if (!ownedBy(job, auth) && !canReadOthers(auth)) return fail("这个任务不属于当前账号", 403);
+  if (!job.inputChunks) return fail("这个任务没有存原件", 404);
+
+  let blob = await readBlob(env, id, "inputs", job.inputChunks);
+  // 跟译文一样，给跨机房同步留点时间
+  for (let i = 0; i < 4 && !blob; i += 1) {
+    await new Promise((r) => setTimeout(r, 3000));
+    blob = await readBlob(env, id, "inputs", job.inputChunks);
+  }
+  if (!blob) {
+    const ageSec = (Date.now() - (job.createdAt || 0)) / 1000;
+    if (ageSec > BLOB_TTL) return fail("原件已过期（原件与译文只保留 3 天）", 410);
+    return fail("原件正在同步，请 10 秒后再点一次下载", 409);
+  }
+  return downloadResponse(blob, job.name || "original.pdf", "original", blob.size || job.inputSize);
 }
 
 async function handleInput(request, env) {
@@ -795,6 +841,7 @@ async function handleHistory(request, env, url) {
       createdAt: job.createdAt,
       ready: job.status === "done",
       target: job.target,
+      hasInput: !!job.inputChunks,        // 页面据此决定要不要显示「原件」链接
     });
   }
   jobs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
@@ -857,6 +904,7 @@ async function handleCommunity(request, env, url) {
         pages: job.stats && job.stats.pages != null ? Number(job.stats.pages) || 0 : null,
         uploader: maskEmail(job.userEmail),
         uploaderFull: job.userEmail || "",                    // 只给管理员，见下面 map
+        hasInput: !!job.inputChunks,                          // 有没有原件，页面据此决定显不显示「原件」
         finishedAt,
         size: Number(job.size || job.resultSize || 0),
       });
@@ -873,6 +921,7 @@ async function handleCommunity(request, env, url) {
       target: j.target,
       pages: j.pages,
       uploader: j.uploader,
+      hasInput: j.hasInput,
       finishedAt: j.finishedAt,
       size: j.size,
     };
@@ -911,6 +960,7 @@ export default {
       if (path === "/api/history" && request.method === "GET") return await handleHistory(request, env, url);
       if (path === "/api/community" && request.method === "GET") return await handleCommunity(request, env, url);
       if (path === "/api/download" && request.method === "GET") return await handleDownload(request, env, url);
+      if (path === "/api/original" && request.method === "GET") return await handleOriginal(request, env, url);
       if (path.startsWith("/api/input/") && request.method === "GET") return await handleInput(request, env);
       if (path.startsWith("/api/result/") && request.method === "POST") return await handleResult(request, env);
       if (path.startsWith("/api/report/") && request.method === "POST") return await handleReport(request, env);

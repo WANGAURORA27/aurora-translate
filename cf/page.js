@@ -52,7 +52,7 @@ export const PAGE = `<!DOCTYPE html>
   .tag { font-size:12px; color:var(--sub); }
   /* 公共文件区：表格窄屏放不下就横向滚，别把卡片撑破 */
   .tablewrap { overflow-x:auto; -webkit-overflow-scrolling:touch; }
-  table.comm { width:100%; border-collapse:collapse; font-size:14px; min-width:620px; }
+  table.comm { width:100%; border-collapse:collapse; font-size:14px; min-width:700px; }
   table.comm th { text-align:left; font-weight:500; color:var(--sub); font-size:12px;
                   padding:0 12px 8px 0; border-bottom:1px solid var(--line); white-space:nowrap; }
   table.comm td { padding:10px 12px 10px 0; border-top:1px solid var(--line); vertical-align:top; }
@@ -139,7 +139,7 @@ export const PAGE = `<!DOCTYPE html>
         <table class="comm">
           <thead>
             <tr>
-              <th>文件名</th><th>输出形式</th><th>页数</th><th>上传者</th><th>完成时间</th><th></th>
+              <th>文件名</th><th>输出形式</th><th>页数</th><th>上传者</th><th>完成时间</th><th>译文</th><th>原件</th>
             </tr>
           </thead>
           <tbody id="commrows"></tbody>
@@ -356,6 +356,17 @@ function tickClock(d) {
   $('jstep').textContent = step + '已用 ' + m + ' 分 ' + (s < 10 ? '0' : '') + s + ' 秒';
 }
 
+/** 造一个下载链接（原文/原件共用，样式跟现有「下载」保持一致） */
+function dlLink(href, text, color, marginLeft) {
+  var a = document.createElement('a');
+  a.href = href;
+  a.textContent = text;
+  a.style.color = color;
+  a.style.whiteSpace = 'nowrap';
+  if (marginLeft) a.style.marginLeft = marginLeft;
+  return a;
+}
+
 function loadHistory() {
   api('/api/history').then(function (r) { return r.json(); }).then(function (d) {
     if (!d.ok || !d.jobs.length) return;
@@ -372,13 +383,16 @@ function loadHistory() {
         (j.status === 'done' ? '已完成' : j.status === 'failed' ? '失败' : '进行中');
       left.appendChild(t); left.appendChild(meta);
       li.appendChild(left);
+      // 两个链接放一个容器里，别让 flex 的 space-between 把它们拆到两头
+      var acts = document.createElement('div');
       if (j.ready) {
-        var a = document.createElement('a');
-        a.href = '/api/download?id=' + j.id + '&password=' + encodeURIComponent(pw);
-        a.textContent = '下载';
-        a.style.color = '#0f9d58';
-        li.appendChild(a);
+        acts.appendChild(dlLink('/api/download?id=' + j.id + '&password=' + encodeURIComponent(pw), '下载', '#0f9d58', ''));
       }
+      // 原件：上传后就一直在（不管译文好没好），有记录才显示
+      if (j.hasInput) {
+        acts.appendChild(dlLink('/api/original?id=' + j.id + '&password=' + encodeURIComponent(pw), '原件', '#6b7280', '12px'));
+      }
+      if (acts.children.length) li.appendChild(acts);
       ul.appendChild(li);
     });
   }).catch(function () {});
@@ -465,14 +479,23 @@ function loadCommunity() {
       tdTime.textContent = fmtTime(f.finishedAt);
 
       var tdDl = document.createElement('td');
-      var a = document.createElement('a');
+      var a = dlLink('/api/download?id=' + encodeURIComponent(f.id), '下载', '', '');
       a.className = 'cdl';
-      a.href = '/api/download?id=' + encodeURIComponent(f.id);
-      a.textContent = '下载';
       tdDl.appendChild(a);
+
+      // 原件：VIP/管理员同样能下别人的（服务端 /api/original 再判一次）
+      var tdSrc = document.createElement('td');
+      if (f.hasInput) {
+        var b = dlLink('/api/original?id=' + encodeURIComponent(f.id), '原件', '#6b7280', '');
+        b.className = 'cdl';
+        tdSrc.appendChild(b);
+      } else {
+        tdSrc.textContent = '—';
+      }
 
       tr.appendChild(tdName); tr.appendChild(tdMode); tr.appendChild(tdPages);
       tr.appendChild(tdUser); tr.appendChild(tdTime); tr.appendChild(tdDl);
+      tr.appendChild(tdSrc);
       rows.appendChild(tr);
     });
   }).catch(function () {});
