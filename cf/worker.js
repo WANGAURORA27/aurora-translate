@@ -35,6 +35,46 @@ const TARGETS = new Set(["中文", "英文", "日文", "韩文", "法文", "德�
 
 const MODE_LABEL = { inplace: "保持版式", bilingual: "中英对照", ocr: "扫描件 OCR" };
 
+const COMMUNITY_LIMIT = 50; // 公共文件区最多列这么多条
+const COMMUNITY_SCAN = 500; // 最多扫这么多条任务记录（KV 读次数要省着用，别把 CPU 打满）
+
+/**
+ * 自动化冒烟测试的任务名长这样：smoke-test.pdf / smoke-refine.pdf / smoke-refine2.pdf …
+ *
+ * 为什么按"前缀"认而不是列一串完整文件名：名字是自检脚本（.github/workflows/smoke.yml）
+ * 自己起的，加一个用例就多一个名字，硬编码一份清单迟早漏。前缀是那串名字唯一稳定的共同点；
+ * 顺带放宽到 smoke_ 和大小写，免得哪天脚本换个写法就漏网。
+ * 真实用户上传的文件叫人名/课件名，不会以 smoke- 开头，误伤的概率可以忽略。
+ */
+const SMOKE_NAME_RE = /^smoke[-_]/i;
+
+function isSmokeJob(job) {
+  return SMOKE_NAME_RE.test(String((job && job.name) || "").trim());
+}
+
+/**
+ * 邮箱脱敏：wanga@qq.com → wa***@qq.com
+ *
+ * 为什么留前两位而不是全打码：公共区里得让人认得出"这是我同事传的"，不然一堆 ***@qq.com
+ * 谁也不敢下；但完整邮箱摊在网上，被扫一遍就是一个通讯录，所以只留个"对得上号"的头。
+ */
+function maskEmail(email) {
+  const s = String(email || "").trim();
+  const at = s.lastIndexOf("@");
+  if (at <= 0) return "";                      // 空邮箱（口令通道传的任务）就空着，页面显示占位符
+  const local = s.slice(0, at);
+  return local.slice(0, local.length >= 2 ? 2 : 1) + "***" + s.slice(at);
+}
+
+/** 当前请求的角色：管理口令通道按管理员算（和 ownedBy 的既有口径保持一致） */
+function authRole(auth) {
+  if (auth.admin) return "admin";
+  return auth.user ? String(auth.user.role || "") : "";
+}
+
+/** 角色给页面看的中文名，报错信息里说人话 */
+const ROLE_LABEL = { user: "普通用户", vip: "VIP", admin: "管理员" };
+
 const storeKind = (env) => (env.FILES ? "r2" : "kv");
 
 function json(data, status = 200) {
@@ -373,6 +413,17 @@ function ownedBy(job, auth) {
   return auth.user.id === job.userId || auth.user.role === "admin";
 }
 
+/**
+ * 能不能读"别人的"任务产出。管理员一直可以（原有口径），VIP 从公共文件区起也可以。
+ *
+ * ★ 只管下载/列表，不管 /api/status：状态里带 runId、phase、note、GitHub 运行链接，
+ *   是"这个任务此刻在干嘛"的过程细节，公共区只展示成品，没有理由把别人的过程摊开。
+ */
+function canReadOthers(auth) {
+  const role = authRole(auth);
+  return role === "admin" || role === "vip";
+}
+
 function authorizeAgent(request, env) {
   if (!env.AGENT_KEY) return "服务端还没设置 AGENT_KEY";
   if (request.headers.get("x-agent-key") !== env.AGENT_KEY) return "内部密钥不对";
@@ -562,7 +613,8 @@ async function handleDownload(request, env, url) {
   const id = url.searchParams.get("id");
   let job = await readJob(env, id);
   if (!job) return fail("没有这个任务", 404);
-  if (!ownedBy(job, auth)) return fail("这个任务不属于当前账号", 403);
+  // 自己的一直能下；VIP/管理员还能下公共文件区里别人的成品（见 canReadOthers 的说明）
+  if (!ownedBy(job, auth) && !canReadOthers(auth)) return fail("这个任务不属于当前账号", 403);
   // 记录说没完成也不算数：先去存储里看译文块在不在（跨机房延迟会把记录写乱）
   job = await healJob(env, job);
   if (!job.resultChunks) return fail("译文还没好", 409);
@@ -726,6 +778,97 @@ async function handleHistory(request, env, url) {
   return json({ ok: true, jobs: jobs.slice(0, 30) });
 }
 
+/**
+ * 公共文件区：VIP 及以上能看到/下载"别人译好的成品"。
+ *
+ * ★ 为什么另开一个接口，而不是给 /api/history 加个参数：
+ *   history 是"我的任务"，里面有进行中、失败的条目和 note；公共区只该有做好的成品。
+ *   两者语义、权限都不同，混在一个接口里，早晚会顺手把别人的过程细节漏出去。
+ *
+ * ★ 为什么排除冒烟任务：.github/workflows/smoke.yml 每次线上自检都会真上传一个样例文件，
+ *   它跟用户文档混在一起会让公共区变成"测试垃圾场"（而且它走口令通道，没有上传者）。
+ */
+async function handleCommunity(request, env, url) {
+  const auth = await authorizeUser(request, env, url);
+  if (auth.error) return fail(auth.error, auth.user ? 402 : 401);
+  const role = authRole(auth);
+  if (role !== "vip" && role !== "admin") {
+    const who = ROLE_LABEL[role] || "当前账号";
+    return fail("公共文件区只对 VIP 及以上开放（" + who + "看不到，升级后自动可见）", 403);
+  }
+
+  // KV 的 list 一次最多 1000 个 key，这里翻页扫，但给自己留个上限：
+  // 任务记录 7 天自动过期，一天最多 30 个，正常也就两三百条。
+  const keys = [];
+  let cursor;
+  let scanTruncated = false;
+  for (;;) {
+    const page = await env.JOBS.list({ prefix: "job:", cursor, limit: 100 });
+    for (const k of page.keys) keys.push(k.name);
+    const done = page.list_complete || !page.cursor;
+    if (done || keys.length >= COMMUNITY_SCAN) {
+      if (!done) scanTruncated = true;
+      break;
+    }
+    cursor = page.cursor;
+  }
+
+  const now = Date.now();
+  const jobs = [];
+  for (let i = 0; i < keys.length; i += 20) {
+    // 一次并发读 20 条，别一条一条地等
+    const batch = await Promise.all(keys.slice(i, i + 20).map((k) => env.JOBS.get(k, "json")));
+    for (const job of batch) {
+      if (!job || job.status !== "done" || !job.resultChunks) continue;
+      if (isSmokeJob(job)) continue;                          // 自动化自检的产物不进公共区
+      const finishedAt = Number(job.doneAt || job.createdAt || 0);
+      // 译文分块只留 3 天（BLOB_TTL），记录却留 7 天。过了 3 天的条目点下载只会拿到 410，
+      // 与其让人白点一次，不如不进列表。
+      if (!finishedAt || now - finishedAt > BLOB_TTL * 1000) continue;
+      jobs.push({
+        id: job.id,
+        name: job.name || "未命名",
+        modeLabel: MODE_LABEL[job.mode] || job.mode || "",
+        target: job.target || "",
+        pages: job.stats && job.stats.pages != null ? Number(job.stats.pages) || 0 : null,
+        uploader: maskEmail(job.userEmail),
+        uploaderFull: job.userEmail || "",                    // 只给管理员，见下面 map
+        finishedAt,
+        size: Number(job.size || job.resultSize || 0),
+      });
+    }
+  }
+
+  jobs.sort((a, b) => b.finishedAt - a.finishedAt);
+  const isAdmin = role === "admin";
+  const files = jobs.slice(0, COMMUNITY_LIMIT).map((j) => {
+    const item = {
+      id: j.id,
+      name: j.name,
+      modeLabel: j.modeLabel,
+      target: j.target,
+      pages: j.pages,
+      uploader: j.uploader,
+      finishedAt: j.finishedAt,
+      size: j.size,
+    };
+    // 管理员看全称：出了事要能找到人，也方便对账。别人一律只看脱敏后的
+    if (isAdmin) item.uploaderFull = j.uploaderFull;
+    return item;
+  });
+
+  const truncated = jobs.length > COMMUNITY_LIMIT || scanTruncated;
+  return json({
+    ok: true,
+    role,
+    files,
+    limit: COMMUNITY_LIMIT,
+    scanned: keys.length,
+    truncated,
+    note: truncated ? "只列了最近 " + COMMUNITY_LIMIT + " 个，更早的没有显示" : "",
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -742,6 +885,7 @@ export default {
       if (path === "/api/upload" && request.method === "PUT") return await handleUpload(request, env, ctx);
       if (path === "/api/status" && request.method === "GET") return await handleStatus(request, env, url);
       if (path === "/api/history" && request.method === "GET") return await handleHistory(request, env, url);
+      if (path === "/api/community" && request.method === "GET") return await handleCommunity(request, env, url);
       if (path === "/api/download" && request.method === "GET") return await handleDownload(request, env, url);
       if (path.startsWith("/api/input/") && request.method === "GET") return await handleInput(request, env);
       if (path.startsWith("/api/result/") && request.method === "POST") return await handleResult(request, env);

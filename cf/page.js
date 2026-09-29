@@ -50,6 +50,16 @@ export const PAGE = `<!DOCTYPE html>
                justify-content:space-between; gap:12px; align-items:center; }
   ul.hist li:first-child { border-top:0; }
   .tag { font-size:12px; color:var(--sub); }
+  /* 公共文件区：表格窄屏放不下就横向滚，别把卡片撑破 */
+  .tablewrap { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  table.comm { width:100%; border-collapse:collapse; font-size:14px; min-width:620px; }
+  table.comm th { text-align:left; font-weight:500; color:var(--sub); font-size:12px;
+                  padding:0 12px 8px 0; border-bottom:1px solid var(--line); white-space:nowrap; }
+  table.comm td { padding:10px 12px 10px 0; border-top:1px solid var(--line); vertical-align:top; }
+  table.comm tr:first-child td { border-top:0; }
+  table.comm td.cname { max-width:230px; word-break:break-all; }
+  table.comm th:last-child, table.comm td:last-child { padding-right:0; }
+  table.comm a.cdl { color:var(--ok); text-decoration:none; white-space:nowrap; }
   code { background:#f1f3f7; padding:2px 6px; border-radius:5px; font-size:13px; }
   .tip { font-size:13px; color:var(--sub); margin-top:10px; }
 </style>
@@ -120,6 +130,23 @@ export const PAGE = `<!DOCTYPE html>
       <h2>最近的任务</h2>
       <ul class="hist" id="hist"><li class="muted">暂无记录</li></ul>
     </div>
+
+    <!-- 公共文件区：只有 VIP / 管理员可见（见 checkAuth；服务端 /api/community 还会再判一次角色） -->
+    <div class="card hidden" id="commcard">
+      <h2>公共文件</h2>
+      <p class="muted" id="commnote">别人翻译好的文件，VIP 及以上可以直接下载。</p>
+      <div class="tablewrap">
+        <table class="comm">
+          <thead>
+            <tr>
+              <th>文件名</th><th>输出形式</th><th>页数</th><th>上传者</th><th>完成时间</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="commrows"></tbody>
+        </table>
+      </div>
+      <p class="muted hidden" id="commempty">还没有别人翻译过的文件</p>
+    </div>
   </div>
 </div>
 
@@ -127,6 +154,7 @@ export const PAGE = `<!DOCTYPE html>
 var pw = sessionStorage.getItem('aurora_pw') || '';
 var authed = false;          // 已通过登录或管理口令验证
 var canRefine = false;       // 当前账号有没有「精修」能力（由 /api/me 决定）
+var role = '';               // 当前账号角色：user / vip / admin（公共文件区是否可见看它）
 var polling = null;
 var elapsedBase = 0;     // 服务端给的已用秒数
 var lastJob = null;      // 最近一次状态，供本地秒表使用
@@ -155,7 +183,7 @@ function api(path, opts) {
 function showApp() {
   $('authcard').classList.add('hidden');
   $('app').classList.remove('hidden');
-  loadHistory();
+  refreshLists();
 }
 
 /** 用登录状态进入（阶段 2 的正常路径） */
@@ -163,20 +191,25 @@ function checkAuth() {
   api('/api/me').then(function (r) { return r.json(); }).then(function (d) {
     if (d.ok && d.logged_in) {
       authed = true;
-      var role = d.user.role === 'admin' ? '（管理员）' : (d.user.role === 'vip' ? '（VIP）' : '');
-      $('authstate').textContent = '已登录：' + d.user.email + role;
+      role = d.user.role || 'user';
+      var tag = role === 'admin' ? '（管理员）' : (role === 'vip' ? '（VIP）' : '');
+      $('authstate').textContent = '已登录：' + d.user.email + tag;
       $('authquota').textContent = d.quota.unlimited
         ? '额度：不限'
         : '本月剩余 ' + d.quota.remaining + ' 页（已用 ' + d.quota.used + ' / ' + d.quota.quota + ' 页）';
       // 精修只有账号带能力位时才给看；服务端还会再校验一遍（前端藏起来不是权限）
       canRefine = d.user.can_refine === 1;
       if (canRefine) $('refinebox').classList.remove('hidden');
+      // 公共文件区：VIP 起可见。藏起来只是不碍眼，真正的门在服务端
+      if (role === 'vip' || role === 'admin') $('commcard').classList.remove('hidden');
       showApp();
       return;
     }
     authed = false;
     canRefine = false;
+    role = '';
     $('refinebox').classList.add('hidden');
+    $('commcard').classList.add('hidden');
     $('authstate').textContent = '还没有登录';
     $('authquota').textContent = '翻译需要先登录 —— 每个人的额度单独计算，互不影响。';
     $('authlogin').classList.remove('hidden');
@@ -289,10 +322,10 @@ function poll(id) {
     if (d.ready) {
       $('jdl').classList.remove('hidden');
       if (polling) { clearInterval(polling); polling = null; }
-      loadHistory();
+      refreshLists();
     } else if (d.status === 'failed') {
       if (polling) { clearInterval(polling); polling = null; }
-      loadHistory();
+      refreshLists();
     }
     if (d.runUrl) {
       $('jlink').classList.remove('hidden');
@@ -345,6 +378,100 @@ function loadHistory() {
         li.appendChild(a);
       }
       ul.appendChild(li);
+    });
+  }).catch(function () {});
+}
+
+/** 任务完成后两个列表都要刷新（公共区可能多出刚译好的那条） */
+function refreshLists() {
+  loadHistory();
+  if (role === 'vip' || role === 'admin') loadCommunity();
+}
+
+/** 时间戳 → 2025-09-29 18:03（本地时区，页面上的时间要跟人自己的表对得上） */
+function fmtTime(ms) {
+  if (!ms) return '—';
+  var d = new Date(ms);
+  function p(n) { return (n < 10 ? '0' : '') + n; }
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+    ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+function fmtSize(b) {
+  if (!b) return '';
+  return b < 1048576 ? Math.round(b / 1024) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
+}
+
+/**
+ * 公共文件区：别人译好的成品，VIP 及以上能下载。
+ * 下载沿用 /api/download 直链 —— 同源导航浏览器会自动带上登录 Cookie，不用再拼口令。
+ */
+function loadCommunity() {
+  api('/api/community').then(function (r) {
+    return r.json().then(function (d) { return { status: r.status, d: d || {} }; },
+                       function () { return { status: r.status, d: {} }; });
+  }).then(function (res) {
+    var d = res.d;
+    // 掉登录 / 角色被降级：整块收起来，别杵在那儿报错
+    if (res.status === 401 || res.status === 403) {
+      $('commcard').classList.add('hidden');
+      return;
+    }
+    // 服务端有话说就照说（比如本月额度用完了，402）—— 空表格看不出原因
+    if (!d.ok) {
+      $('commrows').innerHTML = '';
+      $('commempty').classList.add('hidden');
+      $('commnote').textContent = d.error || '公共文件区暂时打不开，稍后再试';
+      return;
+    }
+    var rows = $('commrows');
+    rows.innerHTML = '';
+    if (!d.files || !d.files.length) {
+      $('commempty').classList.remove('hidden');
+      $('commnote').textContent = '别人翻译好的文件，VIP 及以上可以直接下载。';
+      return;
+    }
+    $('commempty').classList.add('hidden');
+    $('commnote').textContent = d.truncated
+      ? '只列了最近 ' + d.limit + ' 个文件，更早的没有显示。'
+      : '别人翻译好的文件，VIP 及以上可以直接下载。';
+    d.files.forEach(function (f) {
+      var tr = document.createElement('tr');
+
+      var tdName = document.createElement('td');
+      tdName.className = 'cname';
+      tdName.textContent = f.name;
+      var sz = fmtSize(f.size);
+      if (sz) {
+        var sub = document.createElement('div');
+        sub.className = 'tag';
+        sub.textContent = sz;
+        tdName.appendChild(sub);
+      }
+
+      var tdMode = document.createElement('td');
+      tdMode.textContent = (f.modeLabel || '') + (f.target ? ' → ' + f.target : '');
+
+      var tdPages = document.createElement('td');
+      tdPages.textContent = (f.pages === null || f.pages === undefined) ? '—' : f.pages;
+
+      var tdUser = document.createElement('td');
+      tdUser.textContent = f.uploader || '—';
+      if (f.uploaderFull) tdUser.title = f.uploaderFull;   // 只有管理员拿得到全称
+
+      var tdTime = document.createElement('td');
+      tdTime.textContent = fmtTime(f.finishedAt);
+
+      var tdDl = document.createElement('td');
+      var a = document.createElement('a');
+      a.className = 'cdl';
+      a.href = '/api/download?id=' + encodeURIComponent(f.id);
+      a.textContent = '下载';
+      tdDl.appendChild(a);
+
+      tr.appendChild(tdName); tr.appendChild(tdMode); tr.appendChild(tdPages);
+      tr.appendChild(tdUser); tr.appendChild(tdTime); tr.appendChild(tdDl);
+      rows.appendChild(tr);
     });
   }).catch(function () {});
 }
