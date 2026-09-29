@@ -91,7 +91,12 @@ FALLBACK_GROUP_SIZES = (20, 5, 1)
 # 限流熔断：被限流的通道再捶它也没用，只会白等+白花钱（线上实测：中转站
 # 回报 429「上游当前已达到使用限制」后，仍被重试 3 次才换道）。
 _RATE_LIMIT_HINTS = ("429", "rate_limit", "rate limit", "too many requests",
-                     "使用限制", "限流", "quota")
+                     "使用限制", "限流", "quota",
+                     # ★ 线上踩过：主通道余额不足时只报 "HTTP 402 / account balance is
+                     #   insufficient"，原先不在特征里 → 不给降级 → 全篇 0 译文还崩在画字上。
+                     #   这类错误再重试也没用，必须立刻切备用通道。
+                     "402", "insufficient", "balance", "余额不足", "余额不够",
+                     "欠费", "arrears", "billing", "payment required")
 RATE_LIMIT_STRIKES = int(os.environ.get("DOCBRIDGE_RATE_LIMIT_STRIKES", "2"))
 RATE_LIMIT_COOLDOWN = float(os.environ.get("DOCBRIDGE_RATE_LIMIT_COOLDOWN", "120"))
 
