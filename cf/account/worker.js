@@ -302,10 +302,12 @@ async function apiRegister(request, env, url) {
   if (!isFirst && invite) await consumeInvite(env, invite);
 
   const quota = ROLE_QUOTA[role] || DEFAULT_QUOTA;
+  // VIP 与管理员注册即带「精修」能力位；之后由管理员在后台单独改这一列
+  const canRefineInit = (role === "vip" || role === "admin") ? 1 : 0;
   const res = await env.DB.prepare(
-    `INSERT INTO users (email, pass_hash, role, quota_pages, created_at, quota_reset_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).bind(email, await hashPassword(password), role, quota, now, now).run();
+    `INSERT INTO users (email, pass_hash, role, can_refine, quota_pages, created_at, quota_reset_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(email, await hashPassword(password), role, canRefineInit, quota, now, now).run();
 
   const userId = res.meta.last_row_id;
   await audit(env, userId, userId, "register", email + (invite ? "（邀请码）" : ""), request);
@@ -408,6 +410,7 @@ async function apiMe(request, env) {
     user: {
       email: user.email,
       role: user.role,
+      can_refine: Number(user.can_refine) === 1 ? 1 : 0,
       quota_pages: user.quota_pages,
       used_pages: user.used_pages,
       created_at: user.created_at,
@@ -425,14 +428,147 @@ async function apiUsage(request, env) {
   return ok({ items: list.results || [] });
 }
 
-/** 管理员：改权限 / 发额度 / 封号（阶段 3 的后台先留最小可用版本） */
-async function apiAdminUsers(request, env) {
+// ── 后台：总览统计 ─────────────────────────────────────────────────────
+//
+// 统计口径说明（都按北京时间 UTC+8 的自然日/自然月，避免"月初数据跑上个月"）：
+//   今天零点 = floor((now + 8h) / 86400) * 86400 - 8h
+const CST_OFFSET = 8 * 3600;
+const DAY = 86400;
+
+/** 北京时间某一天的零点（unix 秒） */
+function cstDayStart(now) {
+  return Math.floor((now + CST_OFFSET) / DAY) * DAY - CST_OFFSET;
+}
+
+/** 北京时间本月的零点（unix 秒） */
+function cstMonthStart(now) {
+  const d = new Date((now + CST_OFFSET) * 1000);
+  return Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000) - CST_OFFSET;
+}
+
+/** 北京时间的 YYYY-MM-DD */
+function cstDayKey(sec) {
+  return new Date((sec + CST_OFFSET) * 1000).toISOString().slice(0, 10);
+}
+
+const STATS_DAYS = 14;
+
+/** 管理员：总览可视化数据（一次把首页要的数字都取回来） */
+async function apiAdminStats(request, env) {
+  const actor = await currentUser(env, request);
+  if (!actor || actor.role !== "admin") return fail("需要管理员权限", 403);
+
+  const now = Math.floor(Date.now() / 1000);
+  const dayStart = cstDayStart(now);
+  const monthStart = cstMonthStart(now);
+  const weekAgo = now - 7 * DAY;
+  const chartFrom = dayStart - (STATS_DAYS - 1) * DAY;
+
+  const q = (sql, ...args) => env.DB.prepare(sql).bind(...args).first();
+  const [usersTotal, usersNew7d, monthAgg, allAgg, inviteAgg, dailyRes, topRes] = await Promise.all([
+    q("SELECT COUNT(*) AS n FROM users"),
+    q("SELECT COUNT(*) AS n FROM users WHERE created_at >= ?", weekAgo),
+    q("SELECT COALESCE(SUM(pages),0) AS pages, COUNT(*) AS jobs FROM usage WHERE created_at >= ?", monthStart),
+    q("SELECT COALESCE(SUM(pages),0) AS pages, COUNT(*) AS jobs FROM usage"),
+    q("SELECT COALESCE(SUM(used_count),0) AS uses, COUNT(*) AS total FROM invites"),
+    env.DB.prepare(
+      `SELECT strftime('%Y-%m-%d', created_at + ?, 'unixepoch') AS day,
+              COALESCE(SUM(pages),0) AS pages, COUNT(*) AS jobs
+         FROM usage WHERE created_at >= ? GROUP BY day ORDER BY day ASC`,
+    ).bind(CST_OFFSET, chartFrom).all(),
+    env.DB.prepare(
+      `SELECT id, email, role, quota_pages, used_pages FROM users
+        ORDER BY used_pages DESC, id ASC LIMIT 5`,
+    ).all(),
+  ]);
+
+  // 补齐没有记录的日子，前端不用再判断缺口
+  const byDay = {};
+  for (const row of dailyRes.results || []) byDay[row.day] = row;
+  const daily = [];
+  for (let i = STATS_DAYS - 1; i >= 0; i -= 1) {
+    const key = cstDayKey(dayStart - i * DAY);
+    const hit = byDay[key];
+    daily.push({ day: key, pages: hit ? Number(hit.pages) || 0 : 0, jobs: hit ? Number(hit.jobs) || 0 : 0 });
+  }
+
+  const topUsers = (topRes.results || []).map((u) => {
+    const quota = Number(u.quota_pages) || 0;
+    const used = Number(u.used_pages) || 0;
+    return {
+      id: u.id, email: u.email, role: u.role, quota_pages: quota, used_pages: used,
+      // quota 为 0 表示不限量，没有百分比可算
+      percent: quota > 0 ? Math.min(100, Math.round((used / quota) * 1000) / 10) : null,
+    };
+  });
+
+  return ok({
+    users_total: Number(usersTotal && usersTotal.n) || 0,
+    users_new_7d: Number(usersNew7d && usersNew7d.n) || 0,
+    month_pages: Number(monthAgg && monthAgg.pages) || 0,
+    month_jobs: Number(monthAgg && monthAgg.jobs) || 0,
+    total_pages: Number(allAgg && allAgg.pages) || 0,
+    total_jobs: Number(allAgg && allAgg.jobs) || 0,
+    invite_uses: Number(inviteAgg && inviteAgg.uses) || 0,
+    invite_total: Number(inviteAgg && inviteAgg.total) || 0,
+    daily,
+    top_users: topUsers,
+    month_start: monthStart,
+    generated_at: now,
+  });
+}
+
+// ── 后台：用户列表（搜索 / 排序 / 分页）────────────────────────────────
+
+/** 排序白名单：只允许这些列名进入 SQL（值本身仍然走 bind） */
+const USER_SORTS = {
+  created_at: "created_at",
+  last_login_at: "last_login_at",
+  used_pages: "used_pages",
+  quota_pages: "quota_pages",
+  email: "email",
+};
+const MAX_PAGE_SIZE = 100;
+
+/** 管理员：用户列表（q 模糊搜邮箱、sort 排序、order 升降序、page 分页） */
+async function apiAdminUsers(request, env, url) {
   const user = await currentUser(env, request);
   if (!user || user.role !== "admin") return fail("需要管理员权限", 403);
-  const list = await env.DB.prepare(
-    "SELECT id, email, role, status, quota_pages, used_pages, created_at, last_login_at FROM users ORDER BY id DESC LIMIT 200",
-  ).all();
-  return ok({ users: list.results || [] });
+
+  const qRaw = String(url.searchParams.get("q") || "").trim().slice(0, 80);
+  const sortKey = USER_SORTS[String(url.searchParams.get("sort") || "")] ? String(url.searchParams.get("sort")) : "created_at";
+  const order = String(url.searchParams.get("order") || "").toLowerCase() === "asc" ? "ASC" : "DESC";
+  const pageSize = Math.min(Math.max(Math.trunc(Number(url.searchParams.get("page_size")) || 20), 1), MAX_PAGE_SIZE);
+  const page = Math.max(Math.trunc(Number(url.searchParams.get("page")) || 1), 1);
+  const offset = (page - 1) * pageSize;
+
+  // LIKE 的通配符要转义，否则用户输入 % 就会变成"匹配所有"
+  const like = qRaw ? "%" + qRaw.replace(/[\\%_]/g, (c) => "\\" + c) + "%" : "";
+  const where = qRaw ? "WHERE email LIKE ? ESCAPE '\\'" : "";
+
+  const listSql =
+    `SELECT id, email, role, status, can_refine, quota_pages, used_pages, created_at, last_login_at
+       FROM users ${where} ORDER BY ${USER_SORTS[sortKey]} ${order}, id DESC LIMIT ? OFFSET ?`;
+  const countSql = `SELECT COUNT(*) AS n FROM users ${where}`;
+
+  const listStmt = env.DB.prepare(listSql);
+  const countStmt = env.DB.prepare(countSql);
+  const [list, countRow] = await Promise.all([
+    (qRaw ? listStmt.bind(like, pageSize, offset) : listStmt.bind(pageSize, offset)).all(),
+    (qRaw ? countStmt.bind(like) : countStmt).first(),
+  ]);
+
+  const total = Number(countRow && countRow.n) || 0;
+  return ok({
+    users: list.results || [],
+    total,
+    page,
+    page_size: pageSize,
+    pages: Math.max(1, Math.ceil(total / pageSize)),
+    q: qRaw,
+    sort: sortKey,
+    order: order.toLowerCase(),
+  });
 }
 
 async function apiAdminUpdate(request, env) {
@@ -442,6 +578,10 @@ async function apiAdminUpdate(request, env) {
   if (!body) return fail("请求格式不对");
   const id = Number(body.user_id);
   if (!id) return fail("缺少 user_id");
+  // 自锁保护：管理员不能把当前登录的自己封掉（前端也会禁用这个按钮，这里是第二道闸）
+  if (body.status === "banned" && id === Number(actor.id)) {
+    return fail("不能封禁你自己当前登录的管理员账号");
+  }
 
   const sets = [];
   const vals = [];
@@ -465,6 +605,14 @@ async function apiAdminUpdate(request, env) {
   if (Number.isFinite(Number(body.reset_used)) && Number(body.reset_used) === 1) {
     sets.push("used_pages = 0");
   }
+  // 精修能力位：只在显式传 0/1 时改。
+  // 不跟着 role 自动变 —— 角色只是注册时的默认值，管理员可能想让某个 VIP 不用精修
+  // （或给某个普通用户体验一下），一改角色就覆盖掉他的设置反而更意外。
+  const refineGiven = Number(body.can_refine);
+  if (Number.isFinite(refineGiven) && (refineGiven === 0 || refineGiven === 1)) {
+    sets.push("can_refine = ?");
+    vals.push(refineGiven);
+  }
   if (!sets.length) return fail("没有要改的字段");
 
   vals.push(id);
@@ -473,7 +621,11 @@ async function apiAdminUpdate(request, env) {
     await env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
   }
   await audit(env, actor.id, id, "admin-update", JSON.stringify(body).slice(0, 200), request);
-  return ok({ message: "已更新" });
+  // 回传更新后的这一行，前端可以就地刷新（不用整表重载）
+  const updated = await env.DB.prepare(
+    "SELECT id, email, role, status, can_refine, quota_pages, used_pages, created_at, last_login_at FROM users WHERE id = ?",
+  ).bind(id).first();
+  return ok({ message: "已更新", user: updated || null });
 }
 
 /** 管理员：生成邀请码 */
@@ -508,6 +660,165 @@ async function apiAdminInvites(request, env) {
       ORDER BY created_at DESC, code DESC LIMIT 100`,
   ).all();
   return ok({ invites: list.results || [] });
+}
+
+// ── 后台：通道状态 + 余额（尽力而为，绝不让余额拖垮整个接口）──────────────
+
+const CHANNEL_TIMEOUT = 3000; // 每个通道每个请求 3 秒硬超时
+const shortErr = (e) => String((e && e.message) || e || "未知错误").slice(0, 160);
+
+/** 3 秒超时用的 AbortController 包装 */
+function withTimeout(ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => { try { ctrl.abort(); } catch (err) { /* 已结束 */ } }, ms);
+  return { signal: ctrl.signal, done: () => clearTimeout(timer) };
+}
+
+/** 从各种形状的余额响应里找一个看得懂的字段；找不到返回 null */
+function pickBalance(root) {
+  const buckets = [];
+  const push = (o) => { if (o && typeof o === "object") buckets.push(o); };
+  push(root);
+  if (root && typeof root === "object") { push(root.data); push(root.result); push(root.info); }
+  const keys = ["balance", "total_balance", "totalBalance", "available_balance", "availableBalance",
+                "remaining", "remain", "credit", "credits", "total_credits"];
+  for (const o of buckets) {
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === "number" && Number.isFinite(v)) return String(v);
+      if (typeof v === "string" && v.trim()) return v.trim().slice(0, 40);
+    }
+  }
+  return null;
+}
+
+/** 连通性实测：POST {baseUrl}/chat/completions，带 3 秒超时 */
+async function probeChannelChat(baseUrl, apiKey, model) {
+  const t = withTimeout(CHANNEL_TIMEOUT);
+  const started = Date.now();
+  try {
+    const resp = await fetch(baseUrl + "/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(apiKey ? { authorization: "Bearer " + apiKey } : {}),
+      },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: '说"ok"' }], max_tokens: 4 }),
+      signal: t.signal,
+    });
+    const text = (await resp.text()).slice(0, 800);
+    const ms = Date.now() - started;
+    if (!resp.ok) return { ok: false, ms, error: "HTTP " + resp.status + "：" + text.slice(0, 200) };
+    // 有的网关用 200 回一个 error 体，这种也算不通
+    try {
+      const data = JSON.parse(text);
+      if (data && data.error) return { ok: false, ms, error: "接口返回错误：" + String(data.error.message || data.error).slice(0, 200) };
+    } catch (err) { /* 不是 JSON 也无所谓，HTTP 200 就算通 */ }
+    return { ok: true, ms, error: null };
+  } catch (e) {
+    return {
+      ok: false,
+      ms: Date.now() - started,
+      error: e && e.name === "AbortError" ? "超过 " + CHANNEL_TIMEOUT / 1000 + " 秒没有响应" : shortErr(e),
+    };
+  } finally {
+    t.done();
+  }
+}
+
+/** 余额：能查就查，查不到只记原因（410/404/超时/非 JSON 都算"查不到"） */
+async function probeChannelBalance(baseUrl, apiKey) {
+  const t = withTimeout(CHANNEL_TIMEOUT);
+  try {
+    const resp = await fetch(baseUrl + "/user/info", {
+      method: "GET",
+      headers: { accept: "application/json", ...(apiKey ? { authorization: "Bearer " + apiKey } : {}) },
+      signal: t.signal,
+    });
+    const text = (await resp.text()).slice(0, 2000);
+    if (!resp.ok) {
+      const note = resp.status === 410
+        ? "该通道的余额接口已下线（HTTP 410 deprecated），查不到余额"
+        : "该通道不提供余额接口（GET /user/info 返回 HTTP " + resp.status + "）";
+      return { balance: null, note };
+    }
+    let data = null;
+    try { data = JSON.parse(text); } catch (err) { data = null; }
+    if (!data) return { balance: null, note: "余额接口返回的不是 JSON，无法解析" };
+    const found = pickBalance(data);
+    if (found === null) return { balance: null, note: "余额接口可用，但响应里没有可识别的余额字段" };
+    return { balance: found, note: "来自 GET /user/info" };
+  } catch (e) {
+    const aborted = e && e.name === "AbortError";
+    return { balance: null, note: aborted ? "余额查询超时（" + CHANNEL_TIMEOUT / 1000 + " 秒）" : "余额查询失败：" + shortErr(e) };
+  } finally {
+    t.done();
+  }
+}
+
+/** 探测单个通道：连通性 + 余额并发跑，互不影响 */
+async function probeChannel(code, profile) {
+  const name = String(profile.name || code);
+  const baseUrl = String(profile.baseUrl || "").trim().replace(/\/+$/, "");
+  const model = String(profile.chatModel || profile.model || "");
+  const apiKey = String(profile.apiKey || "");
+  const base = { code, name, baseUrl, model, ok: false, ms: 0, error: null, balance: null, balance_note: "" };
+
+  if (!baseUrl) {
+    return { ...base, error: "通道没有配置 baseUrl", balance_note: "未探测（缺少 baseUrl）" };
+  }
+  if (!model) {
+    const bal = await probeChannelBalance(baseUrl, apiKey);
+    return { ...base, error: "通道没有配置 chatModel，无法发最小请求", balance: bal.balance, balance_note: bal.note };
+  }
+
+  const [chat, bal] = await Promise.allSettled([
+    probeChannelChat(baseUrl, apiKey, model),
+    probeChannelBalance(baseUrl, apiKey),
+  ]);
+
+  const chatVal = chat.status === "fulfilled"
+    ? chat.value
+    : { ok: false, ms: 0, error: "探测异常：" + shortErr(chat.reason) };
+  const balVal = bal.status === "fulfilled"
+    ? bal.value
+    : { balance: null, note: "余额查询异常：" + shortErr(bal.reason) };
+
+  return { ...base, ...chatVal, balance: balVal.balance, balance_note: balVal.note };
+}
+
+/** 管理员：通道状态 + 余额（读 Worker 密钥 PROFILES_JSON） */
+async function apiAdminChannels(request, env) {
+  const actor = await currentUser(env, request);
+  if (!actor || actor.role !== "admin") return fail("需要管理员权限", 403);
+
+  const raw = env.PROFILES_JSON;
+  let profiles = null;
+  if (raw) {
+    try { profiles = typeof raw === "string" ? JSON.parse(raw) : raw; } catch (err) { profiles = null; }
+  }
+  if (!profiles || typeof profiles !== "object" || Array.isArray(profiles)) {
+    return ok({ channels: [], note: "服务端没有配置 PROFILES_JSON（或不是合法 JSON 对象），没有可探测的通道", generated_at: Math.floor(Date.now() / 1000) });
+  }
+
+  const entries = Object.entries(profiles).filter(([, v]) => v && typeof v === "object");
+  if (!entries.length) {
+    return ok({ channels: [], note: "PROFILES_JSON 里还没有配置任何通道", generated_at: Math.floor(Date.now() / 1000) });
+  }
+
+  // 通道之间并发探测；某个通道抛错也只影响它自己（allSettled，不整体失败）
+  const settled = await Promise.allSettled(entries.map(([code, p]) => probeChannel(code, p)));
+  const channels = settled.map((r, i) => {
+    const [code, p] = entries[i];
+    if (r.status === "fulfilled") return r.value;
+    return {
+      code, name: String(p.name || code), baseUrl: String(p.baseUrl || ""),
+      model: String(p.chatModel || p.model || ""), ok: false, ms: 0,
+      error: "探测异常：" + shortErr(r.reason), balance: null, balance_note: "未查询（探测本身失败）",
+    };
+  });
+
+  return ok({ channels, generated_at: Math.floor(Date.now() / 1000) });
 }
 
 // ── 入口 ──────────────────────────────────────────────────────────────
@@ -546,7 +857,9 @@ export default {
           case "/api/change-password": return await apiChangePassword(request, env);
           case "/api/me": return await apiMe(request, env);
           case "/api/usage": return await apiUsage(request, env);
-          case "/api/admin/users": return await apiAdminUsers(request, env);
+          case "/api/admin/users": return await apiAdminUsers(request, env, url);
+          case "/api/admin/stats": return await apiAdminStats(request, env);
+          case "/api/admin/channels": return await apiAdminChannels(request, env);
           case "/api/admin/update": return await apiAdminUpdate(request, env);
           case "/api/admin/invite": return await apiAdminInvite(request, env);
           case "/api/admin/invites": return await apiAdminInvites(request, env);

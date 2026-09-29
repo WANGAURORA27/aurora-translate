@@ -28,6 +28,10 @@ export const PAGE = `<!DOCTYPE html>
   button:disabled { background:#b9c3d6; cursor:not-allowed; }
   .row { display:flex; gap:12px; }
   .row > div { flex:1; }
+  /* 「精修」勾选框：不加解释文字，只有两个字 */
+  label.chk { display:flex; align-items:center; gap:8px; font-size:14px; color:var(--ink);
+              margin:14px 0 0; cursor:pointer; }
+  label.chk input { width:auto; margin:0; }
   .hidden { display:none !important; }
   .bar { height:8px; background:#eef1f6; border-radius:99px; overflow:hidden; margin:14px 0 8px; }
   .bar > i { display:block; height:100%; width:0; background:var(--brand); transition:width .25s; }
@@ -93,6 +97,8 @@ export const PAGE = `<!DOCTYPE html>
           </select>
         </div>
       </div>
+      <!-- 精修：默认不勾；只有 can_refine 的账号才显示（见 checkAuth） -->
+      <label class="chk hidden" id="refinebox"><input type="checkbox" id="refine"><span>精修</span></label>
       <div style="margin-top:16px"><button id="upbtn">开始翻译</button></div>
       <div class="bar hidden" id="ubar"><i></i></div>
       <p class="tip" id="upnote">单个文件最大 95MB。30 页大约 1 分钟，几百页的教材会久一些。译文保留 3 天，请及时下载。</p>
@@ -120,6 +126,7 @@ export const PAGE = `<!DOCTYPE html>
 <script>
 var pw = sessionStorage.getItem('aurora_pw') || '';
 var authed = false;          // 已通过登录或管理口令验证
+var canRefine = false;       // 当前账号有没有「精修」能力（由 /api/me 决定）
 var polling = null;
 var elapsedBase = 0;     // 服务端给的已用秒数
 var lastJob = null;      // 最近一次状态，供本地秒表使用
@@ -161,10 +168,15 @@ function checkAuth() {
       $('authquota').textContent = d.quota.unlimited
         ? '额度：不限'
         : '本月剩余 ' + d.quota.remaining + ' 页（已用 ' + d.quota.used + ' / ' + d.quota.quota + ' 页）';
+      // 精修只有账号带能力位时才给看；服务端还会再校验一遍（前端藏起来不是权限）
+      canRefine = d.user.can_refine === 1;
+      if (canRefine) $('refinebox').classList.remove('hidden');
       showApp();
       return;
     }
     authed = false;
+    canRefine = false;
+    $('refinebox').classList.add('hidden');
     $('authstate').textContent = '还没有登录';
     $('authquota').textContent = '翻译需要先登录 —— 每个人的额度单独计算，互不影响。';
     $('authlogin').classList.remove('hidden');
@@ -201,6 +213,8 @@ $('upbtn').onclick = function () {
   xhr.setRequestHeader('x-filename', encodeURIComponent(f.name));
   xhr.setRequestHeader('x-mode', $('mode').value);
   xhr.setRequestHeader('x-target', encodeURIComponent($('target').value));
+  // 明确送 0/1：服务端据 can_refine 复核，前端传来的 1 不算数
+  xhr.setRequestHeader('x-refine', (canRefine && $('refine').checked) ? '1' : '0');
   xhr.upload.onprogress = function (e) {
     if (e.lengthComputable) {
       fill.style.width = (e.loaded / e.total * 100).toFixed(0) + '%';

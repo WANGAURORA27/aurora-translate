@@ -652,6 +652,168 @@ def test_both_prompt_templates_carry_context_placeholder():
         check(f"doc_context_in_{kind}_prompt", "Micro lecture" in prompt, prompt[:160])
 
 
+# ---------------------------------------------------------------- 精修（第二遍打磨）
+
+def _fake_pair(n, user, prefix=""):
+    """按请求里的条目数造 JSON 回复（精修提示词里每对是 SOURCE/DRAFT 两行）。"""
+    return "{" + ", ".join(f'"{i+1}": "{prefix}译文{i+1}"' for i in range(n)) + "}"
+
+
+def _count_pairs(user):
+    return len([l for l in user.splitlines() if l[:1].isdigit() and ". SOURCE: " in l])
+
+
+def test_refine_polishes_drafts_and_shares_stats():
+    """勾了精修：返回的必须是**精修后**的译文，且两遍的用量记在同一份 stats 里。"""
+    refine_cfg = {"provider": "openai", "api": "responses",
+                  "baseUrl": "https://relay.invalid/v1", "apiKey": "sk-r", "chatModel": "gpt-x"}
+    seen = {"main": 0, "refine": 0}
+    orig = T.call_chat
+
+    def fake(cfg, system, user, json_mode=True, **kw):
+        if cfg is refine_cfg:
+            seen["refine"] += 1
+            n = _count_pairs(user)
+            return _fake_pair(n, user, prefix="精修")
+        seen["main"] += 1
+        return _fake_pair(len([l for l in user.splitlines()
+                               if l[:1].isdigit() and ". " in l]), user, prefix="初译")
+
+    T.call_chat = fake
+    try:
+        base = T.make_translator(CFG, kind="line")
+        tr = T.make_refiner(base, refine_cfg, kind="line")
+        out = tr(["The firm maximises profit.", "Demand curve shifts right."])
+    finally:
+        T.call_chat = orig
+
+    check("refine_output_used", all(o.startswith("精修") for o in out), out)
+    check("refine_called_once_per_batch", seen["refine"] == 1, seen)
+    check("refine_stats_shared", tr.stats is base.stats, "两份 dict 会让初译用量读不到")
+    check("refine_status_ok", tr.stats.get("refine") == "ok", tr.stats.get("refine"))
+    check("main_stats_still_counted", tr.stats.get("calls", 0) >= 1, tr.stats.get("calls"))
+
+
+def test_refine_failure_falls_back_to_draft():
+    """★ 最重要的一条：精修那一步失败时，初译结果照常返回，任务不算失败。"""
+    refine_cfg = {"provider": "openai", "api": "chat",
+                  "baseUrl": "https://relay.invalid/v1", "apiKey": "sk-r", "chatModel": "broken"}
+    orig = T.call_chat
+
+    def fake(cfg, system, user, json_mode=True, **kw):
+        if cfg is refine_cfg:
+            raise T.TranslateError("接口返回 HTTP 404：model not found")
+        return _fake_pair(len([l for l in user.splitlines()
+                               if l[:1].isdigit() and ". " in l]), user, prefix="初译")
+
+    T.call_chat = fake
+    try:
+        base = T.make_translator(CFG, kind="line")
+        tr = T.make_refiner(base, refine_cfg, kind="line")
+        out = tr(["The firm maximises profit.", "Demand curve shifts right."])
+    finally:
+        T.call_chat = orig
+
+    check("refine_fail_keeps_draft", all(o.startswith("初译") for o in out), out)
+    check("refine_fail_len_kept", len(out) == 2, out)
+    check("refine_fail_status", tr.stats.get("refine") == "failed", tr.stats.get("refine"))
+    check("refine_fail_note_mentions_draft",
+          "初译" in str(tr.stats.get("refine_note")), tr.stats.get("refine_note"))
+    check("refine_fail_batches_counted",
+          tr.stats.get("refine_failed_batches") == 1, tr.stats.get("refine_failed_batches"))
+
+
+def test_refine_partial_failure_keeps_other_batches():
+    """一批精修失败、另一批成功：失败那批退回初译，成功的照常替换。"""
+    refine_cfg = {"provider": "openai", "api": "chat",
+                  "baseUrl": "https://relay.invalid/v1", "apiKey": "sk-r", "chatModel": "gpt-x"}
+    orig_call = T.call_chat
+    orig_lines = T.MAX_CHUNK_LINES
+    seen = {"refine": 0}
+
+    def fake(cfg, system, user, json_mode=True, **kw):
+        if cfg is refine_cfg:
+            seen["refine"] += 1
+            # 含第二条的那一批永远给坏回复（两次尝试都坏），保证是"部分失败"
+            if "two here" in user:
+                return "这不是 JSON"
+            return _fake_pair(_count_pairs(user), user, prefix="精修")
+        return _fake_pair(len([l for l in user.splitlines()
+                               if l[:1].isdigit() and ". " in l]), user, prefix="初译")
+
+    T.call_chat = fake
+    T.MAX_CHUNK_LINES = 1                       # 一个条目一批，方便造"一批坏一批好"
+    try:
+        base = T.make_translator(CFG, kind="line")
+        tr = T.make_refiner(base, refine_cfg, kind="line")
+        out = tr(["Sentence number one here.", "Sentence number two here."])
+    finally:
+        T.call_chat = orig_call
+        T.MAX_CHUNK_LINES = orig_lines
+
+    check("refine_partial_output", out[0].startswith("精修") and out[1].startswith("初译"), out)
+    check("refine_partial_status", tr.stats.get("refine") == "partial", tr.stats.get("refine"))
+
+
+def test_refine_without_config_degrades_quietly():
+    """通道没配 refineModel：不报错，原样返回初译，并留下可写进备注的原因。"""
+    orig = T.call_chat
+
+    def fake(cfg, system, user, json_mode=True, **kw):
+        return _fake_pair(len([l for l in user.splitlines()
+                               if l[:1].isdigit() and ". " in l]), user, prefix="初译")
+
+    T.call_chat = fake
+    try:
+        base = T.make_translator(CFG, kind="line")
+        tr = T.make_refiner(base, None, kind="line")
+        out = tr(["The firm maximises profit."])
+    finally:
+        T.call_chat = orig
+
+    check("refine_nocfg_draft", out[0].startswith("初译"), out)
+    check("refine_nocfg_status", tr.stats.get("refine") == "failed", tr.stats.get("refine"))
+    check("refine_nocfg_note", "refineModel" in str(tr.stats.get("refine_note")),
+          tr.stats.get("refine_note"))
+
+
+def test_resolve_refine_config_reads_refine_fields_only():
+    """精修配置只认 refine* 字段；没配就返回 None（绝不悄悄退回主通道）。"""
+    with_r = {"p": {"baseUrl": "https://main.invalid/v1", "apiKey": "sk-m",
+                    "chatModel": "main-model", "api": "chat",
+                    "refineBaseUrl": "https://relay.invalid/v1", "refineApiKey": "sk-r",
+                    "refineModel": "gpt-5.5", "refineApi": "responses"}}
+    without = {"p": {"baseUrl": "https://main.invalid/v1", "apiKey": "sk-m",
+                     "chatModel": "main-model"}}
+    only_model = {"p": {"baseUrl": "https://main.invalid/v1", "apiKey": "sk-m",
+                        "chatModel": "main-model", "refineModel": "gpt-5.5"}}
+    orig = T.load_profiles
+    try:
+        T.load_profiles = lambda *a, **k: with_r
+        cfg = T.resolve_refine_config("p")
+        check("refine_cfg_model", (cfg or {}).get("chatModel") == "gpt-5.5", cfg)
+        check("refine_cfg_api", (cfg or {}).get("api") == "responses", cfg)
+        check("refine_cfg_base", (cfg or {}).get("baseUrl") == "https://relay.invalid/v1", cfg)
+        T.load_profiles = lambda *a, **k: without
+        check("refine_cfg_none_without_fields", T.resolve_refine_config("p") is None, "应返回 None")
+        # 只有 refineModel 而没有自己的 baseUrl/Key：拿不到凭据 → 也算没配
+        T.load_profiles = lambda *a, **k: only_model
+        check("refine_cfg_needs_key", T.resolve_refine_config("p") is None, "缺 refineApiKey 应为 None")
+    finally:
+        T.load_profiles = orig
+
+
+def test_refine_prompt_template_has_all_placeholders():
+    """精修提示词模板的占位符必须齐（漏一个就会 str.format 报错/丢内容）。"""
+    prompt = T._build_refine_prompt(
+        [("The firm maximises profit.", "这个公司最大化利润。")], "简体中文", "line")
+    check("refine_prompt_has_source", "The firm maximises profit." in prompt, prompt[:80])
+    check("refine_prompt_has_draft", "这个公司最大化利润。" in prompt, prompt[:80])
+    check("refine_prompt_numbered", "1. SOURCE: " in prompt, prompt[:80])
+    check("refine_prompt_no_leftover_braces", "{n}" not in prompt and "{target}" not in prompt,
+          prompt[:80])
+
+
 if __name__ == "__main__":
     for fn in [v for k, v in sorted(globals().items()) if k.startswith("test_")]:
         fn()

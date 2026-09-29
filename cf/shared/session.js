@@ -57,6 +57,7 @@ export async function currentUser(env, request) {
   const row = await env.DB.prepare(
     `SELECT s.token_hash AS token_hash, s.expires_at AS expires_at,
             u.id AS id, u.email AS email, u.role AS role, u.status AS status,
+            u.can_refine AS can_refine,
             u.quota_pages AS quota_pages, u.used_pages AS used_pages,
             u.quota_reset_at AS quota_reset_at, u.created_at AS created_at
        FROM sessions s JOIN users u ON u.id = s.user_id
@@ -74,6 +75,16 @@ export function quotaState(user) {
   const quota = Number(user.quota_pages) || 0;
   const used = Number(user.used_pages) || 0;
   return { unlimited: false, quota, used, remaining: Math.max(0, quota - used) };
+}
+
+/**
+ * 这个账号有没有「精修」能力。
+ *
+ * 为什么看能力位而不是现算 role：管理员要能单独给某个普通用户开、也能把某个 VIP 关掉。
+ * 角色只是注册时写进 can_refine 的默认值，之后以那一列为准（见 cf/account/schema.sql）。
+ */
+export function canRefine(user) {
+  return !!(user && Number(user.can_refine) === 1);
 }
 
 /** 记账：扣额度 + 写用量流水（翻译完成后调用） */

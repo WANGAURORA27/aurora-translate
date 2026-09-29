@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS users (
   pass_hash     TEXT    NOT NULL,                     -- pbkdf2$迭代$盐$哈希（绝不存明文）
   role          TEXT    NOT NULL DEFAULT 'user',      -- user / vip / admin
   status        TEXT    NOT NULL DEFAULT 'active',    -- active / banned
+  can_refine    INTEGER NOT NULL DEFAULT 0,           -- 能不能用「精修」（VIP/管理员开通；管理员可单独改）
   quota_pages   INTEGER NOT NULL DEFAULT 200,         -- 每月可用页数（0 = 不限）
   used_pages    INTEGER NOT NULL DEFAULT 0,           -- 本月已用
   quota_reset_at INTEGER NOT NULL DEFAULT 0,          -- 上次重置用量的时间

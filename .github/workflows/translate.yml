@@ -40,6 +40,10 @@ on:
       target:
         description: 目标语言（云端任务用；留空按简体中文）
         required: false
+      refine:
+        description: 精修（网页端 VIP 勾选后自动填 1；0=只用初译）
+        required: false
+        default: "0"
 
 permissions:
   contents: write               # 把译文推到 results 分支
@@ -364,6 +368,7 @@ jobs:
           DEFAULT_PROFILE: ${{ vars.DEFAULT_PROFILE }}
           MODE: ${{ inputs.mode }}
           TARGET: ${{ inputs.target }}
+          REFINE: ${{ inputs.refine }}
           NAME: ${{ steps.fetch.outputs.name }}
         run: |
           set -euo pipefail
@@ -376,10 +381,13 @@ jobs:
           stem="${NAME%.*}"
           ext="${NAME##*.}"
           out="work/${stem}_${MODE}.${ext}"
+          # 精修：勾了才让 CLI 跑第二遍；没勾（0）时命令行与以前完全一样。
+          # 精修失败不会让这一步失败（CLI 内部退回初译，只把结论写进 stats.json）
           python3 tools/translate_cli.py \
             --input "work/$NAME" --output "$out" \
             --mode "$MODE" --target "$t" \
             --profile "${DEFAULT_PROFILE:-}" \
+            --refine "${REFINE:-0}" \
             --options '{"prefetch": true, "shared_cache": false}'
           echo "out=$out" >> "$GITHUB_OUTPUT"
           echo "### 统计" >> "$GITHUB_STEP_SUMMARY"
@@ -410,7 +418,19 @@ jobs:
           JOB: ${{ inputs.job_id }}
         run: |
           [ -f work/stats.json ] || echo '{}' > work/stats.json
-          body=$(python3 -c 'import json,sys; print(json.dumps({"status":"done","note":"翻译完成","stats":json.load(open("work/stats.json"))}))')
+          # 备注要如实说明精修这一步的结果：精修失败时任务仍是成功的，
+          # 但用户必须知道拿到的是初译（stats.json 里的 refine 由 CLI 写）
+          body=$(python3 - <<'PY'
+          import json
+          s = json.load(open("work/stats.json", encoding="utf-8"))
+          note = "翻译完成"
+          if s.get("refine") == "failed":
+              note = "翻译完成（精修未完成，已使用初译）"
+          elif s.get("refine") == "partial":
+              note = "翻译完成（部分内容精修未完成，已使用初译）"
+          print(json.dumps({"status": "done", "note": note, "stats": s}, ensure_ascii=False))
+          PY
+          )
           curl -fsS -X POST "$WORKER/api/report/$JOB" -H "x-agent-key: $KEY" \
             -H 'content-type: application/json' -d "$body" || true
 

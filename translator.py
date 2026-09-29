@@ -357,6 +357,53 @@ def resolve_config(profile_code: str | None = None, override: dict | None = None
     }
 
 
+def resolve_refine_config(profile_code: str | None = None) -> dict | None:
+    """解析「精修通道」的配置；**没配置就返回 None**（调用方据此走"精修未完成"）。
+
+    为什么单独一张配置、而不是复用主通道：精修通常挂在**另一个供应商**上
+    （profiles.json 里 snow 的 refineBaseUrl/refineApiKey/refineModel/refineApi 就是
+    指向一个 GPT 中转站；同传站 LiveBridge 用的也是同一组字段），与主通道的
+    baseUrl / 模型都没有关系，推导不出来。
+
+    为什么不在没配时退回主通道：那等于用同一个模型把译文再翻一遍，白花钱且看不出差别。
+    「花两遍钱」这件事必须由 profiles.json 显式声明，而不是悄悄发生。
+
+    注意 refineApi 的默认值：精修换了 baseUrl（= 另一家端点）却没写协议名时按
+    ``responses``——这与同传站 server.mjs 的取值一致（很多 GPT 中转站只有 /responses）。
+    同一家端点则沿用主通道的协议。协议名不认识就当作没配精修，不硬试。
+    """
+    prof = (load_profiles().get(profile_code) if profile_code else None) or None
+    if not prof:
+        return None
+    model = str(prof.get("refineModel") or "").strip()
+    key = str(prof.get("refineApiKey") or "").strip()
+    base = str(prof.get("refineBaseUrl") or prof.get("baseUrl") or "").strip().rstrip("/")
+    if not (model and key and base):
+        return None
+    api = str(prof.get("refineApi") or "").strip().lower()
+    if not api:
+        main_base = str(prof.get("baseUrl") or "").strip().rstrip("/")
+        main_api = str(prof.get("api") or prof.get("chatApi") or "").strip().lower()
+        api = main_api if base == main_base else "responses"
+    if api not in _API_ALIASES:
+        return None
+    try:
+        # 配置坏掉（占位符/中文）时**不抛错**：那是"精修用不了"，
+        # 不是"这份文件翻译不了"，调用方要能安静地退回初译。
+        _check_ascii("精修 Base URL", base)
+        _check_ascii("精修 API Key", key)
+    except TranslateError:
+        return None
+    return {
+        "provider": "openai",
+        "api": _API_ALIASES[api],
+        "baseUrl": base,
+        "apiKey": key,
+        "chatModel": model,
+        "thinking": None,
+    }
+
+
 # ---------------------------------------------------------------- HTTP 调用
 
 
@@ -573,6 +620,55 @@ def _build_prompt(items: list[str], target: str, kind: str, extra: str = "",
     tpl = BATCH_LINE_PROMPT if kind == "line" else BATCH_PARA_PROMPT
     return tpl.format(n=len(items), numbered=numbered, target=target, extra=extra,
                       context=context_block)
+
+
+# ---------------------------------------------------------------- 精修（第二遍打磨）
+#
+# 「精修」= 初译之上再用第二个模型（通常是 GPT）把每一段译文重写一遍。
+# 开关与凭据都来自 profiles.json 的 refineBaseUrl / refineApiKey / refineModel / refineApi，
+# 与同传站 LiveBridge 用的是同一组字段（见 live-interpreter/server.mjs 的 task='refine'）。
+
+REFINE_SYSTEM_LINE = (
+    "You are a senior bilingual editor. You improve existing translations of document "
+    "text and never change the meaning. You output ONLY valid JSON, nothing else."
+)
+
+REFINE_PROMPT = """\
+Below are numbered pairs of source text and a first-pass {target} translation.
+
+Polish EACH pair: fix mistranslations, wrong terminology and awkward wording, and make \
+the {target} read like it was written by a native professional. Keep every piece of \
+information the source carries.
+
+Return ONLY a JSON object mapping item numbers to improved translations, e.g. {{"1": "译文1"}}.
+
+Rules:
+- The JSON object MUST contain exactly the keys 1..{n} ({n} keys), no more, no less.
+- {shape}
+- Output {target} only.
+- NEVER add or drop information: no summarising, no explanations, no notes.
+- NEVER output ellipsis (……, …, ...) or placeholders like "原文未提供" or "保持原样"; \
+always output the translation itself.
+- If a first-pass translation is already correct and idiomatic, return it unchanged.
+- Preserve numbers, formulas, code identifiers and citation markers as-is, and keep all \
+mathematical symbols exactly as they are.
+{context}
+Pairs:
+{numbered}"""
+
+
+def _build_refine_prompt(pairs: list[tuple[str, str]], target: str, kind: str,
+                         context_block: str = "") -> str:
+    numbered = "\n".join(
+        f"{i + 1}. SOURCE: {s}\n   DRAFT: {d}" for i, (s, d) in enumerate(pairs))
+    shape = ("Each value must cover EXACTLY ONE pair and be a single line of text "
+             "(no line breaks inside a value). The sources are independent fragments, "
+             "so never merge two pairs into one value."
+             if kind == "line" else
+             "Each value must cover EXACTLY ONE pair and be a single line of text "
+             "(no line breaks inside a value). Never merge two pairs into one value.")
+    return REFINE_PROMPT.format(n=len(pairs), numbered=numbered, target=target,
+                                shape=shape, context=context_block)
 
 
 # 术语表默认位置：先找 docbridge 自己的，再找兄弟目录（与 同类项目 共用那份）
@@ -1041,6 +1137,154 @@ def make_translator(cfg: dict, source_lang: str = "auto",
                 stats["failed"] += 1
             say(f"[warn] 该条未能翻译，保留原文：{text[:40]!r}")
         return out
+
+    translate.stats = stats          # type: ignore[attr-defined]
+    return translate
+
+
+def make_refiner(draft_translate, refine_cfg: dict | None,
+                 target_lang: str = "zh-Hans", kind: str = "line",
+                 log=None) -> callable:
+    """把初译回调包一层「精修」，返回同样签名的 ``translate(texts, context=None)``。
+
+    精修是**逐批就地**做的：先拿初译，再把这批的「原文 + 初译」交给精修模型重写，
+    返回精修后的译文；管线拿到的仍是等长同序的列表，所以所有模式（原位/双语/OCR/Word）
+    都不用改一行代码就吃得到精修。
+
+    ★ 设计上最重要的一条：**精修失败绝不能拖垮这份文件**。
+      没有配精修通道、网络失败、模型回的不是合法 JSON、批量对不上号……任何一种情况
+      都只把那一批退回初译，函数照常返回结果，任务状态仍是成功。失败只体现在
+      ``stats["refine"]``（ok / partial / failed）与 ``stats["refine_note"]`` 上，
+      由上层在任务备注里写「精修未完成，已使用初译」。
+
+    为什么把初译和精修的统计记在**同一份 dict** 里（而不是各自一份）：
+    ``translate_cli.py`` / ``jobs.py`` 都是读 ``tr.stats`` 汇总用量，
+    两份 dict 会让初译的 token 统计在包装后读不到（看起来像"没花钱"）。
+    """
+    stats = getattr(draft_translate, "stats", None)
+    if stats is None:
+        stats = {}
+    target = _LANG_PROMPT_NAME.get(target_lang, target_lang)
+    stats.setdefault("refine_batches", 0)
+    stats.setdefault("refine_failed_batches", 0)
+    stats.setdefault("refine_calls", 0)
+    stats.setdefault("refine_tokens_in", 0)
+    stats.setdefault("refine_tokens_out", 0)
+    # 精修是并发的（有线程池），统计要加锁，不然 token 数会丢
+    refine_lock = threading.Lock()
+
+    def say(msg: str) -> None:
+        if log:
+            try:
+                log(msg)
+            except Exception:                        # noqa: BLE001
+                pass
+
+    if not refine_cfg:
+        stats["refine"] = "failed"
+        stats["refine_note"] = "通道没有配置精修模型（refineModel / refineApiKey），已使用初译"
+    else:
+        stats["refine"] = "ok"          # 没有可精修的条目时就是 ok（配置是好的）
+        stats["refine_note"] = ""
+
+    def _chunks(pairs: list[tuple[int, str, str]]):
+        chunk: list[tuple[int, str, str]] = []
+        chars = 0
+        for pair in pairs:
+            ln = len(pair[1]) + len(pair[2])
+            if chunk and (len(chunk) >= MAX_CHUNK_LINES or chars + ln > MAX_CHUNK_CHARS):
+                yield chunk
+                chunk, chars = [], 0
+            chunk.append(pair)
+            chars += ln
+        if chunk:
+            yield chunk
+
+    def _refine_one(batch: list[tuple[int, str, str]],
+                    ctx_block: str = "") -> list[str] | None:
+        """精修一批；成功返回译文列表，彻底失败返回 None（调用方保留初译）。"""
+        pairs = [(s, d) for _i, s, d in batch]
+        sources = [s for _i, s, _d in batch]
+        for attempt in range(2):
+            prompt = _build_refine_prompt(pairs, target, kind, ctx_block)
+            # 第一次要 JSON（好解析），失败再退回普通模式重试一次
+            sink: dict = {}
+            try:
+                reply = call_chat(refine_cfg, REFINE_SYSTEM_LINE, prompt,
+                                  json_mode=(attempt == 0), usage_sink=sink)
+            except TranslateError as exc:
+                say(f"[warn] 精修请求失败（{exc}）")
+                continue
+            with refine_lock:
+                stats["refine_calls"] += 1
+                stats["refine_tokens_in"] += int(sink.get("tokens_in") or 0)
+                stats["refine_tokens_out"] += int(sink.get("tokens_out") or 0)
+            parsed = _parse_json_reply(reply, len(pairs)) if reply else None
+            if parsed is None:
+                say("[warn] 精修回复不是合法 JSON 或条目对不上号")
+                continue
+            # 用**原文**当基准校验（数学符号不能丢、目标语言比例要对），
+            # 否则精修可以悄悄把公式删掉而没人发现
+            reason = _validate_reason(parsed, sources, target_lang, kind)
+            if not reason:
+                return parsed
+            say(f"[warn] 精修结果校验未通过（{reason}）")
+        return None
+
+    def translate(texts, context=None) -> list[str]:
+        drafts = draft_translate(texts, context)
+        if not refine_cfg:
+            return drafts
+        try:
+            src = ["" if t is None else str(t) for t in texts]
+            out = list(drafts)
+            # 只精修「真的被翻译过」的条目：原文本身就是中文/纯符号的没得打磨，
+            # 初译失败的条目（draft == 原文）也跳过，免得把原文交给精修模型去意译
+            todo = [(i, s, d) for i, (s, d) in enumerate(zip(src, drafts))
+                    if needs_translation(s, target_lang) and d and d != s]
+            if not todo:
+                return out
+            batches = list(_chunks(todo))
+            workers = min(CONCURRENCY, len(batches))
+            say(f"  精修 {len(todo)} 条（{len(batches)} 批）")
+
+            def work(batch):
+                return batch, _refine_one(batch, _context_block(context, [s for _i, s, _d in batch]))
+
+            if workers <= 1:
+                results = [work(b) for b in batches]
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    results = list(pool.map(work, batches))
+
+            ok_batches = 0
+            for batch, res in results:
+                if res is None:
+                    # 这一批退回初译 —— 不抛错、不中断，其余批次继续
+                    with refine_lock:
+                        stats["refine_failed_batches"] += 1
+                    continue
+                for (i, _s, _d), v in zip(batch, res):
+                    out[i] = v
+                with refine_lock:
+                    stats["refine_batches"] += 1
+                ok_batches += 1
+            if stats["refine_failed_batches"]:
+                total = ok_batches + stats["refine_failed_batches"]
+                stats["refine"] = "failed" if ok_batches == 0 else "partial"
+                stats["refine_note"] = (
+                    "精修未完成，已使用初译" if ok_batches == 0
+                    else f"精修部分未完成（{stats['refine_failed_batches']}/{total} 批），"
+                         f"这些内容已使用初译")
+                say(f"[warn] {stats['refine_note']}")
+            return out
+        except Exception as exc:                     # noqa: BLE001
+            # 兜底：精修这一段无论出什么意外（含线程池、内存、第三方库的怪异常），
+            # 都必须让初译结果照常交付
+            stats["refine"] = "failed"
+            stats["refine_note"] = "精修未完成，已使用初译"
+            say(f"[warn] 精修异常，已使用初译：{exc}")
+            return drafts
 
     translate.stats = stats          # type: ignore[attr-defined]
     return translate

@@ -22,7 +22,7 @@
 
 import { PAGE } from "./page.js";
 // 与账户站共用同一份会话/额度逻辑，并读同一个 D1（阶段 2）
-import { currentUser, quotaState, addUsage } from "./shared/session.js";
+import { currentUser, quotaState, addUsage, canRefine } from "./shared/session.js";
 
 const MAX_UPLOAD = 95 * 1024 * 1024; // Workers 免费版请求体上限 100MB，留点余量
 const CHUNK = 20 * 1024 * 1024; // KV 单值上限 25MiB，切 20MiB 一块最稳
@@ -397,6 +397,10 @@ async function handleUpload(request, env, ctx) {
   const target = decodeHeader(request.headers.get("x-target"), "中文");
   if (!TARGETS.has(target)) return fail("目标语言不对：" + target);
 
+  // 精修：前端说了不算，只认账号上的能力位（can_refine）。
+  // 没有权限就**静默降级成 0**，不报错 —— 老客户端/手写请求带了这个头也不该把上传打断。
+  const refine = (request.headers.get("x-refine") === "1" && canRefine(auth.user)) ? 1 : 0;
+
   const declared = Number(request.headers.get("content-length") || 0);
   if (declared > MAX_UPLOAD) {
     return fail("文件太大（" + humanSize(declared) + "），当前上限 " + humanSize(MAX_UPLOAD), 413);
@@ -421,6 +425,7 @@ async function handleUpload(request, env, ctx) {
     name,
     mode,
     target,
+    refine,                                        // 1 = 初译之上再用精修模型打磨一遍
     size,
     status: "queued",
     note: "已收到，正在排队",
@@ -439,7 +444,10 @@ async function handleUpload(request, env, ctx) {
     "/actions/workflows/" + (env.WORKFLOW || "translate.yml") + "/dispatches",
     {
       method: "POST",
-      body: JSON.stringify({ ref: env.GH_REF || "main", inputs: { job_id: id, mode, target } }),
+      body: JSON.stringify({
+        ref: env.GH_REF || "main",
+        inputs: { job_id: id, mode, target, refine: refine ? "1" : "0" },
+      }),
     },
   );
   if (!resp.ok) {
@@ -532,6 +540,7 @@ async function handleStatus(request, env, url) {
     mode: job.mode,
     modeLabel: MODE_LABEL[job.mode] || job.mode,
     target: job.target,
+    refine: job.refine ? 1 : 0,
     size: job.size,
     status,
     // phase 是"给人看的当前阶段"，note 是更细的说明
@@ -646,14 +655,18 @@ async function handleReport(request, env) {
   if (job.userId && !job.usageRecorded && job.stats && Number(job.stats.pages) >= 0) {
     try {
       const pages = Number(job.stats.pages) || 0;
+      // 精修要跑两遍模型（初译 + 打磨），所以按 1.5 倍计页；向上取整，不足 1 页也算 1 页。
+      // 上传时的预检仍按实际页数，这里才是真正扣账的地方。
+      const billed = job.refine ? Math.ceil(pages * 1.5) : pages;
       await addUsage(env, job.userId, {
         jobId: job.id,
-        pages,
+        pages: billed,
         tokensIn: job.stats.api_tokens_in,
         tokensOut: job.stats.api_tokens_out,
-        note: `${job.mode || ""} · ${job.name || ""}`,
+        note: `${job.mode || ""} · ${job.name || ""}${job.refine ? " · 精修" : ""}`,
       });
       job.usageRecorded = true;
+      job.billedPages = billed;
     } catch (err) {
       // 记账失败不让任务失败，下轮状态查询还会再试
     }
@@ -676,7 +689,7 @@ async function handleMe(request, env) {
   return json({
     ok: true,
     logged_in: true,
-    user: { email: user.email, role: user.role },
+    user: { email: user.email, role: user.role, can_refine: canRefine(user) ? 1 : 0 },
     quota: {
       unlimited: q.unlimited,
       quota: q.quota,
@@ -703,6 +716,7 @@ async function handleHistory(request, env, url) {
       modeLabel: MODE_LABEL[job.mode] || job.mode,
       status: job.status,
       note: job.note || "",
+      refine: job.refine ? 1 : 0,
       createdAt: job.createdAt,
       ready: job.status === "done",
       target: job.target,

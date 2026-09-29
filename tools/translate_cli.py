@@ -61,6 +61,8 @@ def main() -> int:
                     choices=["single", "fallback", "hybrid"], help="通道策略")
     ap.add_argument("--target", default="zh-Hans", help="目标语言")
     ap.add_argument("--source", default="auto", help="源语言")
+    ap.add_argument("--refine", default="0", choices=["0", "1"],
+                    help="精修：1 = 初译之上再用 refineModel 打磨一遍（默认 0，保持原样）")
     ap.add_argument("--options", default="{}", help="额外的管线参数（JSON）")
     args = ap.parse_args()
 
@@ -136,6 +138,17 @@ def main() -> int:
                            route=args.strategy, channel_names=names,
                            glossary=glossary)
 
+    # 精修：勾了才包一层。包完之后失败也只是退回初译，不会让整份文件失败（见 make_refiner）
+    if args.refine == "1":
+        refine_cfg = T.resolve_refine_config(code)
+        if refine_cfg:
+            print("  精修      %s（%s 协议）" % (refine_cfg.get("chatModel"), refine_cfg.get("api")))
+        else:
+            print("  精修      通道 %s 没有配置 refineModel / refineApiKey，本次按初译交付" % code)
+        tr = T.make_refiner(tr, refine_cfg, target_lang=args.target,
+                            kind="line" if fmt == "pdf" else "paragraph",
+                            log=lambda m: print("  " + str(m), flush=True))
+
     last = [""]
 
     def progress(done, total, note=""):
@@ -163,6 +176,11 @@ def main() -> int:
     print("  输出      %s (%.1f MB)" % (args.output, size / 1048576))
     print("  用量      接口调用 %s 次 · 入 %s / 出 %s tokens" % (
         stats.get("api_calls"), stats.get("api_tokens_in"), stats.get("api_tokens_out")))
+    if args.refine == "1":
+        # 精修有没有跑成，要让人在日志里一眼看到（Actions 里也靠这行排查）
+        print("  精修      %s%s" % (
+            stats.get("api_refine") or "ok",
+            ("：" + str(stats.get("api_refine_note"))) if stats.get("api_refine_note") else ""))
     print("  详情      %s" % (stats.get("detail") or "")[:400])
 
     # 给 Actions 用的机器可读结果
@@ -179,6 +197,8 @@ def main() -> int:
                       "api_tokens_in", "api_tokens_out"):
                 if stats.get(k) is not None:
                     fh.write("| %s | %s |\n" % (k, stats[k]))
+            if stats.get("api_refine"):
+                fh.write("| 精修 | %s |\n" % (stats.get("api_refine_note") or stats["api_refine"]))
 
     # 机器可读统计：Actions 里用它把进度/页数回传给网页端
     stats_path = os.environ.get("DOCBRIDGE_STATS_OUT")
@@ -187,6 +207,16 @@ def main() -> int:
                 "chars_in", "chars_out", "api_calls", "api_tokens_in",
                 "api_tokens_out", "cached_lines")
         payload = {k: stats[k] for k in keys if stats.get(k) is not None}
+        # 精修结果单独给上层：Worker 靠它把「精修未完成，已使用初译」写进任务备注
+        if args.refine == "1":
+            payload["refine"] = stats.get("api_refine") or "ok"
+            if stats.get("api_refine_note"):
+                payload["refine_note"] = stats["api_refine_note"]
+            for k in ("api_refine_batches", "api_refine_failed_batches",
+                      "api_refine_tokens_in", "api_refine_tokens_out",
+                      "api_refine_calls"):
+                if stats.get(k) is not None:
+                    payload[k[4:]] = stats[k]
         payload["seconds"] = round(time.time() - started, 1)
         payload["outputMB"] = round(size / 1048576, 2)
         payload["mode"] = args.mode
