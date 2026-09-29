@@ -664,7 +664,7 @@ async function apiAdminInvites(request, env) {
 
 // ── 后台：通道状态 + 余额（尽力而为，绝不让余额拖垮整个接口）──────────────
 
-const CHANNEL_TIMEOUT = 3000; // 每个通道每个请求 3 秒硬超时
+const CHANNEL_TIMEOUT = 8000; // 每个通道每个请求 3 秒硬超时
 const shortErr = (e) => String((e && e.message) || e || "未知错误").slice(0, 160);
 
 /** 3 秒超时用的 AbortController 包装 */
@@ -692,23 +692,49 @@ function pickBalance(root) {
   return null;
 }
 
-/** 连通性实测：POST {baseUrl}/chat/completions，带 3 秒超时 */
+/**
+ * 连通性实测。
+ *
+ * ★ 两种协议都要试：Codex 类中转站（如 codex.water555.com）只支持
+ *   /responses，打 /chat/completions 会回 405 —— 线上就因为这个把它误判成"不通"。
+ */
 async function probeChannelChat(baseUrl, apiKey, model) {
+  const first = await probeOnce(baseUrl + "/chat/completions", apiKey, model, "chat");
+  if (first.ok) return first;
+  // 405/404 说明这个网关不认 chat/completions，换 Responses 协议再试一次
+  if (/HTTP (404|405)/.test(first.error || "")) {
+    const second = await probeOnce(baseUrl + "/responses", apiKey, model, "responses");
+    if (second.ok) return second;
+    return second;
+  }
+  return first;
+}
+
+/** 单次探测（chat 或 responses 协议） */
+async function probeOnce(url, apiKey, model, kind) {
   const t = withTimeout(CHANNEL_TIMEOUT);
   const started = Date.now();
   try {
-    const resp = await fetch(baseUrl + "/chat/completions", {
+    const body = kind === "responses"
+      ? { model, input: '说"ok"', max_output_tokens: 16 }
+      : { model, messages: [{ role: "user", content: '说"ok"' }], max_tokens: 4 };
+    const resp = await fetch(url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         ...(apiKey ? { authorization: "Bearer " + apiKey } : {}),
       },
-      body: JSON.stringify({ model, messages: [{ role: "user", content: '说"ok"' }], max_tokens: 4 }),
+      body: JSON.stringify(body),
       signal: t.signal,
     });
     const text = (await resp.text()).slice(0, 800);
     const ms = Date.now() - started;
-    if (!resp.ok) return { ok: false, ms, error: "HTTP " + resp.status + "：" + text.slice(0, 200) };
+    if (!resp.ok) {
+      const hint = /unsupported_country_region_territory/.test(text)
+        ? "（该服务不支持当前地区 —— 从 Cloudflare 发请求用不了这个通道）"
+        : "";
+      return { ok: false, ms, error: "HTTP " + resp.status + "：" + text.slice(0, 160) + hint };
+    }
     // 有的网关用 200 回一个 error 体，这种也算不通
     try {
       const data = JSON.parse(text);
