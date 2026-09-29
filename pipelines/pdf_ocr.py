@@ -687,6 +687,10 @@ def run(src_path, out_path, *, translate, progress=None, options=None) -> dict:
                 pt.init_cjk_font(font_spec)
             except Exception as exc:          # noqa: BLE001
                 raise RuntimeError("中文字体不可用：%s（%s）" % (font_spec, exc)) from exc
+        # 绘制失败计数清零（与 pdf_inplace 同一口径）：个别字符画不出来只计数，
+        # 末尾写进 detail —— 线上那次真实故障就发生在本链路的绘制阶段。
+        if hasattr(pt, "reset_draw_failures"):
+            pt.reset_draw_failures()
 
         emit(0, "开始：共 %d 页，OCR 语言 %s @%ddpi" % (pages, language, dpi))
 
@@ -821,12 +825,17 @@ def run(src_path, out_path, *, translate, progress=None, options=None) -> dict:
                    % stats["rotated_pages"])
     if stats["kept_lines"]:
         detail += "，%d 行译文放不下已保留原文" % stats["kept_lines"]
+    # 字体容错统计：把"有 N 个字未能绘制"如实报出来（宁可个别字缺，也不静默产出坏结果）
+    fails = pt.draw_failures() if hasattr(pt, "draw_failures") else {"chars": 0}
+    if fails.get("chars"):
+        detail += "；⚠️ 有 %d 个字未能绘制（字体缺字形或不可用）" % fails["chars"]
     if stats["ocr_error"]:
         detail += "；部分页 OCR 报错：%s" % stats["ocr_error"]
     detail += ("；图片 输入 %d 张 -> 输出 %d 张（数量一致 ✅）；"
                "OCR %s @%ddpi；字体 %s"
                % (n_img_in, n_img_out, language, dpi,
-                  pt.CJK_FONTFILE or "china-s（内嵌兜底）"))
+                  ("%s（%s）" % (pt.CJK_FONTFILE, getattr(pt, "CJK_FONT_NAME", "") or "?"))
+                  if pt.CJK_FONTFILE else "china-s（内嵌兜底）"))
     return {
         "units": stats["units"],
         "chars_in": stats["chars_in"],

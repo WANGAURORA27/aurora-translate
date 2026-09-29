@@ -494,6 +494,512 @@ def test_parse_helpers_are_forgiving():
     assert res["pages"] == 3 and res["units"] > 0, res
 
 
+# ---------------------------------------------- 换行合并 / 分配 / 去重（纯函数）
+
+def _entry(i, text, x0=72.0, y0=100.0, x1=400.0, h=13.0, size=11.0):
+    """构造一个"行 entry"（与 pdf_inplace._merge_units 的输入同构）。"""
+    return {"i": i, "text": text, "size": size,
+            "rect": fitz.Rect(x0, y0, x1, y0 + h)}
+
+
+def test_merge_units_joins_only_obvious_continuations():
+    """合并判据必须是"保守"的：漏合并只是退回旧行为，误合并会毁掉整段译文。
+
+    合并需要同时满足：上一行不以句末标点结尾、下一行小写开头（或以续行标点开头）、
+    不是列表项、同列、行距正常、字号接近。
+    """
+    # ① 连字符断词 + 小写续行 → 合并，并且还原连字符（pub- + lic → public）
+    assert mod._merge_units([_entry(0, "The pub-", y0=100),
+                             _entry(1, "lic policy is strict.", y0=116)]) == [[0, 1]]
+    assert mod._unit_text([_entry(0, "The pub-"), _entry(1, "lic policy is strict.")]) \
+        == "The public policy is strict."
+    # 无连字符时用空格拼接
+    assert mod._unit_text([_entry(0, "one sentence here"), _entry(1, "and its tail.")]) \
+        == "one sentence here and its tail."
+
+    # ② 上一行以句末标点结尾 → 不合并
+    assert mod._merge_units([_entry(0, "Ends with a period.", y0=100),
+                             _entry(1, "lower case but a new sentence", y0=116)]) \
+        == [[0], [1]]
+    # ③ 下一行大写开头 → 不合并（新句子 / 新标题）
+    assert mod._merge_units([_entry(0, "continues without punctuation", y0=100),
+                             _entry(1, "Upper case starts a new one", y0=116)]) \
+        == [[0], [1]]
+    # ④ 下一行是列表项/编号 → 不合并
+    assert mod._merge_units([_entry(0, "no punctuation at the end", y0=100),
+                             _entry(1, "1. numbered item", y0=116)]) == [[0], [1]]
+    assert mod._merge_units([_entry(0, "no punctuation at the end", y0=100),
+                             _entry(1, "\u2022 bullet item", y0=116)]) == [[0], [1]]
+    # ⑤ 行距过大（>= 段间距）→ 不合并
+    assert mod._merge_units([_entry(0, "wrapped line without punctuation", y0=100),
+                             _entry(1, "next paragraph starts lower", y0=130)]) \
+        == [[0], [1]]
+    # ⑥ 字号突变（标题/图注）→ 不合并
+    assert mod._merge_units([_entry(0, "wrapped line without punctuation", y0=100),
+                             _entry(1, "caption in another size", y0=116, size=16.0)]) \
+        == [[0], [1]]
+    # ⑦ 不同列（左缘差 >15pt）→ 不合并
+    assert mod._merge_units([_entry(0, "left column line without punct", x0=72, y0=100),
+                             _entry(1, "right column continues here", x0=320, y0=116)]) \
+        == [[0], [1]]
+    # ⑧ 三行连续（都不以句末标点结尾）→ 合成一个单元
+    assert mod._merge_units([_entry(0, "a line that does not end", y0=100),
+                             _entry(1, "with punctuation and continues", y0=116),
+                             _entry(2, "into a third line.", y0=132)]) == [[0, 1, 2]]
+    # ⑨ 单元按最小行号排序：批内顺序与上游逐行口径一致
+    assert mod._merge_units([_entry(0, "single one.", y0=100),
+                             _entry(1, "single two.", y0=116),
+                             _entry(2, "wrapped head", y0=132),
+                             _entry(3, "and its tail.", y0=148)]) == [[0], [1], [2, 3]]
+    print("    [合并] 9 组判据全部符合预期")
+
+
+def test_split_translation_uses_width_ratio_and_never_duplicates():
+    """译文按行盒宽度比例分配；分配不了时也**绝不整句重复**（用户最刺眼的问题）。"""
+    zh = "这一章介绍了消费者行为的核心概念与边际效用的变化规律"
+    parts = mod._split_translation(zh, [300.0, 150.0, 50.0])
+    assert len(parts) == 3 and all(parts), parts
+    assert "".join(parts) == zh, parts                 # 不丢字
+    assert parts[0] not in (zh,) and parts[1] != zh, parts   # 不整句重复
+    assert len(parts[0]) > len(parts[2]), parts        # 宽的行分到更多字
+
+    # 译文比行数还短：整句只放最宽的那一行，其余留空（调用方只覆盖原文）
+    assert mod._split_translation("短", [100.0, 300.0, 120.0]) == ["", "短", ""]
+    # 单行单元原样返回
+    assert mod._split_translation("只有一行", [200.0]) == ["只有一行"]
+
+    # 切点不落在拉丁单词中间（机器学习 + Python语言，而不是 机器学习P + ython语言）
+    assert mod._split_translation("机器学习Python语言", [160.0, 100.0]) \
+        == ["机器学习", "Python语言"], mod._split_translation("机器学习Python语言", [160.0, 100.0])
+    print("    [分配] 比例/保底/不重复/不断词 全部符合预期")
+
+
+def test_dedupe_merges_similar_adjacent_translations_only():
+    """去重只打"相邻且高度相似"的译文；过短的与不相邻的正常重复必须保留。"""
+    a = "这一章介绍了消费者行为的核心概念与研究方法"
+    b = "这一章介绍了消费者行为的核心概念与分析方法"       # 与 a 高度相似
+    c = "价格机制协调买卖双方的决策"
+    entries = [_entry(0, "x", y0=100), _entry(1, "y", y0=116),
+               _entry(2, "z", y0=132)]
+    trans = {0: a, 1: b, 2: c}
+    assert mod._dedupe_page(mod._line_columns(entries), trans) == {1}
+    assert trans[1] == mod.COVER_ONLY, trans
+
+    # 相似的两句之间夹了一句不相干的（不相邻）→ 不去重
+    trans2 = {0: a, 1: c, 2: b}
+    assert mod._dedupe_page(mod._line_columns(entries), trans2) == set()
+
+    # 过短的句子（<6 字）不去重：可能是正常的重复强调
+    short_entries = [_entry(0, "x", y0=100), _entry(1, "y", y0=116)]
+    trans3 = {0: "是", 1: "是"}
+    assert mod._dedupe_page(mod._line_columns(short_entries), trans3) == set()
+
+    # 相似度确实是字符二元组 Jaccard：完全不同 → 不删
+    assert not mod._similar("消费者行为研究", "宏观经济政策分析")
+    assert mod._similar(a, b)
+    print("    [去重] 相邻相似才合并、短的/不相邻的不动")
+
+
+# ---------------------------------------------- 版面几何（端到端 + 真实 bbox 断言）
+
+CJK_SPAN_RE = __import__("re").compile(r"[\u4e00-\u9fff]")
+
+
+def _build_wrapped_sample(path):
+    """造一页"真实排版"的样例：跨行段落 + 不需要翻译的纯数字行 + 超长行。"""
+    lines = [
+        "This paragraph is wrapped across several physical lines because the",
+        "typesetter broke it where the column ended, so each line is only a",
+        "fragment of one sentence.",
+        "The second paragraph also wraps here and continues on the next line",
+        "without any terminal punctuation at the break point.",
+        "12345",
+        "A very long single line of English text that will need a much longer Chinese translation than usual.",
+    ]
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    y = 90
+    for text in lines:
+        page.insert_text((72, y), text, fontname="tiro", fontsize=11)
+        y += 17
+    doc.save(path, garbage=4, deflate=True)
+    doc.close()
+    return path, lines
+
+
+def _fake_long(calls=None, ratio=0.8):
+    """假翻译器：产出**故意比英文更长**的中文（不联网、不花钱）。
+
+    每个汉字由源文本字符确定性地映射而来：既能保证"逐行不同"（否则会被
+    新加的碎片去重正确地删掉，掩盖版面问题），又保证长度 = 源长度 × ratio，
+    于是中文宽度约为英文的 1.5 倍 —— 逼着排版走自适应缩字号。
+    """
+    def fake(texts, ctx=None):
+        if calls is not None:
+            calls.append(list(texts))
+        out = []
+        for i, t in enumerate(texts):
+            n = max(3, int(round(len(t) * ratio)))
+            mapped = "".join(chr(0x4e00 + (ord(c) * 7 + 13) % 1200) for c in t)
+            out.append("第%d段" % (i + 1) + mapped[:n])
+        return out
+    return fake
+
+
+def _cjk_visual_lines(path, page_no=0):
+    """把译文（含 CJK 的 span）聚成视觉行，返回**墨迹盒**。
+
+    PyMuPDF 给的 CJK span bbox 用的是字体 ascent/descent（实测 1.4em 高），
+    比真实墨迹（约 1.04em）大得多，直接拿来判相交会把正常行距判成重叠。
+    所以这里按"基线 ± 实测墨迹比例"重算：上方 0.88em、下方 0.16em。
+
+    同一基线上的 span 可能是表格不同单元格（各自一条），所以在组内按 x 间距切开
+    （间距 > 0.6 倍字号即不同单元格），不能整行合并。
+    """
+    spans = []
+    with fitz.open(path) as doc:
+        page = doc[page_no]
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type", 0) != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if CJK_SPAN_RE.search(span["text"]):
+                        spans.append((span["origin"][1], span["bbox"][0],
+                                      span["bbox"][2], span["size"], span["text"]))
+    spans.sort(key=lambda s: (round(s[0], 1), s[1]))
+    rows = []
+    for base, x0, x1, size, text in spans:
+        if (rows and abs(rows[-1]["base"] - base) <= 0.6
+                and x0 - rows[-1]["x1"] <= 0.6 * size):
+            row = rows[-1]
+            row["x1"] = max(row["x1"], x1)
+            row["size"] = max(row["size"], size)
+            row["text"] += text
+            continue
+        rows.append({"x0": x0, "x1": x1, "base": base, "size": size, "text": text})
+    for row in rows:
+        row["ink_top"] = row["base"] - 0.88 * row["size"]
+        row["ink_bottom"] = row["base"] + 0.16 * row["size"]
+    return rows
+
+
+def test_merged_paragraph_is_translated_once_then_split_back():
+    """端到端①：换行段落只翻一次（合并），译文按行分配，不出现整句重复。"""
+    d = _case_dir("merge_e2e")
+    src = os.path.join(d, "wrapped.pdf")
+    _build_wrapped_sample(src)
+    calls = []
+    mod.run(src, os.path.join(d, "out.pdf"), translate=_fake_long(calls),
+            options={"shared_cache": False})
+
+    # 三行一段被合并成一个单元：一次调用里同时出现段首与段尾
+    merged = [c for c in calls
+              if any("This paragraph is wrapped" in t and "fragment of one sentence." in t
+                     for t in c)]
+    assert merged, "跨行段落没有被合并成一个翻译单元：%r" % (calls,)
+    flat = [t for c in calls for t in c]
+    assert not any("fragment of one sentence." in t and "This paragraph" not in t
+                   for t in flat), "段尾行被单独翻译了（没有合并）"
+
+    lines = _cjk_visual_lines(os.path.join(d, "out.pdf"))
+    texts = [ln["text"] for ln in lines]
+    assert len(texts) >= 4, texts
+    # 没有任何两行拿到完全相同的译文（那就是用户看到的"同一句翻两遍"）
+    assert len(set(texts)) == len(texts), texts
+    print("    [合并] 一次调用覆盖整段；输出 %d 行译文，无整句重复" % len(texts))
+
+
+def test_drawn_translations_fit_width_and_never_overlap():
+    """端到端②（几何硬约束）：故意更长的中文译文
+
+    ① 每行译文都在页面内、且不超出它所属原行的 x 范围（允许小容差）；
+    ② 同页任意两行译文的墨迹盒互不相交；
+    ③ 字号不低于设定下限（原行字号的 60%）；
+    ④ 不需要翻译的原行（纯数字）没有被译文压住。
+    """
+    d = _case_dir("geometry")
+    src = os.path.join(d, "wrapped.pdf")
+    _lines = _build_wrapped_sample(src)
+    out = os.path.join(d, "out.pdf")
+    res = mod.run(src, out, translate=_fake_long(), options={"shared_cache": False})
+
+    with fitz.open(src) as doc:
+        page = doc[0]
+        originals = []
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type", 0) != 0:
+                continue
+            for line in block.get("lines", []):
+                text = "".join(s["text"] for s in line["spans"]).strip()
+                if text:
+                    originals.append({"rect": fitz.Rect(line["bbox"]), "text": text,
+                                      "size": max(s["size"] for s in line["spans"]),
+                                      "base": max(s["origin"][1] for s in line["spans"])})
+
+    def match_original(box):
+        """归行：返回可能归属的原行候选。
+
+        译文折行时首行会被基线钳制整体上移，"基线最近"不可靠；判断"有没有超出原行
+        x 范围"的可靠口径是：同栏、基线相近的候选里**最宽的那一行能不能装下**。
+        """
+        return [o for o in originals
+                if abs(o["base"] - box["base"]) <= 1.6 * max(o["size"], box["size"])
+                and o["rect"].x0 <= box["x0"] + 1.0]
+
+    boxes = _cjk_visual_lines(out)
+    assert boxes, "没有画出任何译文"
+    with fitz.open(out) as doc:
+        out_page = doc[0]
+        page_rect = out_page.rect
+
+    shrank = 0
+    for box in boxes:
+        # ① 页面内
+        assert box["x0"] >= page_rect.x0 - 0.5, box
+        assert box["x1"] <= page_rect.x1 + 0.5, box
+        cands = match_original(box)
+        assert cands, ("译文附近找不到任何原行", box)
+        widest = max(cands, key=lambda o: o["rect"].x1)
+        nearest = min(cands, key=lambda o: abs(o["base"] - box["base"]))
+        # ① 不超原行 x 范围（容差 2pt：中文禁则允许行尾闭标点略微出界）
+        assert box["x0"] >= widest["rect"].x0 - 1.0, (box, widest)
+        assert box["x1"] <= widest["rect"].x1 + 2.0, (box, widest)
+        # ③ 字号下限 60%（同段字号一致，按基线最近的原行比）
+        assert box["size"] >= 0.6 * nearest["size"] - 0.51, (box, nearest)
+        if box["size"] < nearest["size"] * 0.92 - 0.01:
+            shrank += 1
+    assert shrank > 0, "样例没有触发自适应缩字号，测试没覆盖到目标路径"
+
+    # ② 两两不相交
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            a, b = boxes[i], boxes[j]
+            assert (a["x1"] <= b["x0"] or b["x1"] <= a["x0"]
+                    or a["ink_bottom"] <= b["ink_top"] or b["ink_bottom"] <= a["ink_top"]), \
+                "两行译文墨迹相交：\n%r\n%r" % (a, b)
+
+    # ④ 纯数字行没被覆盖、也没被压到
+    digit = next(o for o in originals if o["text"] == "12345")
+    with fitz.open(out) as doc:
+        text = doc[0].get_text()
+    assert "12345" in text, "纯数字行被覆盖了"
+    for box in boxes:
+        assert not (box["x0"] < digit["rect"].x1 and digit["rect"].x0 < box["x1"]
+                    and box["ink_top"] < digit["rect"].y1
+                    and digit["rect"].y0 < box["ink_bottom"]), \
+            ("译文压住了不需要翻译的行：%r vs %r" % (box, digit))
+    print("    [几何] %d 行译文：不超行宽、两两不相交、字号 >= 60%%、纯数字行未被压"
+          % len(boxes))
+    assert res["pages"] == 1
+
+
+def test_wrapped_translation_never_presses_the_next_paragraph():
+    """回归：**跨段落**的相邻行之间也必须留出空白。
+
+    上游 group_paragraphs 会按行距把一段切成多个"段落"（dy>6pt 就切）。只跟
+    "同段下一行"比较的话，跨段的下一行就管不住了 —— 实测在一份 PPT 版式的真实
+    PDF 上，译文折行后整体上移 18pt 压住了上一行（几何脚本抓到的真问题）。
+    """
+    d = _case_dir("crosspara")
+    src = os.path.join(d, "crosspara.pdf")
+    lines = [
+        "First paragraph first line that keeps going without any stop",
+        "first paragraph second line ends here.",
+        "Second paragraph first line also fairly long and keeps going",
+        "second paragraph second line ends here.",
+    ]
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    y = 100
+    for text in lines:
+        page.insert_text((72, y), text, fontname="tiro", fontsize=11)
+        y += 22                       # 行距 22 → dy≈7.5 > 6，group_paragraphs 会切成两段
+    doc.save(src, garbage=4, deflate=True)
+    doc.close()
+
+    out = os.path.join(d, "out.pdf")
+    mod.run(src, out, translate=_fake_long(), options={"shared_cache": False})
+    boxes = _cjk_visual_lines(out)
+
+    with fitz.open(src) as doc:
+        originals = [{"rect": fitz.Rect(l["bbox"]),
+                      "text": "".join(s["text"] for s in l["spans"]).strip()}
+                     for b in doc[0].get_text("dict")["blocks"] if b.get("type", 0) == 0
+                     for l in b.get("lines", [])]
+        originals = [o for o in originals if o["text"]]
+
+    # ② 两两不相交（旧实现在这里会挂：折行后的译文压住上一段）
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            a, b = boxes[i], boxes[j]
+            assert (a["x1"] <= b["x0"] or b["x1"] <= a["x0"]
+                    or a["ink_bottom"] <= b["ink_top"]
+                    or b["ink_bottom"] <= a["ink_top"]), \
+                "两行译文墨迹相交：\n%r\n%r" % (a, b)
+    # 每一条译文都不许压到**其它原行**的矩形
+    for box in boxes:
+        for orig in originals:
+            if abs(box["base"] - (orig["rect"].y0 + orig["rect"].y1) / 2) < 20:
+                continue              # 跳过自己的原行（基线附近）
+            assert not (box["x0"] < orig["rect"].x1 and orig["rect"].x0 < box["x1"]
+                        and box["ink_top"] < orig["rect"].y1
+                        and orig["rect"].y0 < box["ink_bottom"]), \
+                ("译文压到了别的原行：%r vs %r" % (box, orig))
+    print("    [跨段] %d 行译文，两两不相交、未压到其它原行" % len(boxes))
+
+
+# ---------------------------------------------- 字体容错（线上真实崩溃回归）
+
+def _build_f1_collision_sample(path):
+    """造一份「自带 /F1 且该字体没有内嵌文件」的 PDF —— PowerPoint 导出的真实特征。
+
+    线上那份 Ch3&4 Cases 的每一页都长这样：Resources 里有 /F1 = Arial-BoldMT
+    但没有 FontFile。旧代码把缺字回退字体注册成 fontname="F1"，PyMuPDF 见名复用
+    源 PDF 的这个坏字体 → get_char_widths → 'NoneType' has no attribute 'm_internal'。
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=420, height=260)
+    page.insert_text((30, 50), "Chapter 3 Case Study of Market Structure",
+                     fontname="helv", fontsize=13)
+    font_xref = doc.get_new_xref()
+    doc.update_object(
+        font_xref,
+        "<< /Type /Font /Subtype /TrueType /BaseFont /Arial-BoldMT "
+        "/Encoding /WinAnsiEncoding >>")
+    res = doc.get_new_xref()
+    doc.update_object(res, "<< >>")
+    doc.xref_set_key(res, "Font", "<< >>")
+    doc.xref_set_key(res, "Font/F1", "%d 0 R" % font_xref)
+    doc.xref_set_key(page.xref, "Resources", "%d 0 R" % res)
+    doc.save(path, garbage=4, deflate=True)
+    doc.close()
+    return path
+
+
+def test_source_pdf_font_name_collision_does_not_crash():
+    """回归：源 PDF 自带 /F1（无内嵌文件）时，整条原位翻译必须跑完而不是崩掉。"""
+    d = _case_dir("fontcollision")
+    src = os.path.join(d, "slide.pdf")
+    _build_f1_collision_sample(src)
+    with fitz.open(src) as doc:
+        names = {f[4] for f in doc[0].get_fonts(full=True)}
+    assert "F1" in names, "样例没造出 /F1：%r" % names
+
+    # 主字体缺字形的字符（∂ ∆ ⊂ 之类）才会走"缺字回退字体"分支 —— 正是崩的那条
+    probe = next((ch for ch in "\u2202\u2206\u2282\u2209\u21d2"
+                  if mod.pt._needs_fallback(ch)), None)
+    assert probe, "没有找到主字体缺失的字符，无法覆盖回退字体分支"
+
+    def fake(texts, ctx=None):
+        return ["【译%s】%s" % (probe, t) for t in texts]
+
+    out = os.path.join(d, "out.pdf")
+    mod.pt.reset_draw_failures()
+    res = mod.run(src, out, translate=fake, options={"shared_cache": False})
+    assert os.path.isfile(out) and res["pages"] == 1
+    assert mod.pt.draw_failures()["chars"] == 0, mod.pt.draw_failures()
+
+    with fitz.open(out) as doc:
+        names = {f[4] for f in doc[0].get_fonts(full=True)}
+    # 我们注册的字体必须是**自己的名字**（DSH*），而不是复用源 PDF 的 /F1
+    assert any(n.startswith("DSH") for n in names), names
+    print("    [字体] 源 PDF 的 /F1 未被复用；输出字体资源 %r" % sorted(names))
+
+
+def test_unusable_font_candidates_degrade_gracefully():
+    """候选字体全部不可用（不存在 / 取不到字宽）→ 退回内置字体，不崩、可上报。"""
+    d = _case_dir("fontdegrade")
+    src = _sample_pdf()
+    out = os.path.join(d, "out.pdf")
+    pt = mod.pt
+    saved = (pt.FONT_CANDIDATES, pt.FALLBACK_CANDIDATES, pt.font_drawable,
+             os.environ.pop("DOCBRIDGE_PDF_FONT", None))
+    try:
+        pt.FONT_CANDIDATES = ["/nonexistent/a.ttf", "/nonexistent/b.otf"]
+        pt.FALLBACK_CANDIDATES = ["/nonexistent/math.ttf"]
+        pt.font_drawable = lambda _p: False       # 模拟"能加载但取不到字宽"
+        res = mod.run(src, out, translate=_fake(),
+                      options={"shared_cache": False, "font": "/nonexistent/x.ttf"})
+    finally:
+        (pt.FONT_CANDIDATES, pt.FALLBACK_CANDIDATES, pt.font_drawable,
+         env) = saved
+        if env is not None:
+            os.environ["DOCBRIDGE_PDF_FONT"] = env
+    assert os.path.isfile(out), "优雅降级失败：没有产出文件"
+    assert "china-s" in res["detail"], res["detail"]
+    assert mod.pt.CJK_FONTFILE is None, mod.pt.CJK_FONTFILE
+    print("    [降级] 候选全不可用 -> 内置字体，任务仍完成：%s" % res["detail"][:60])
+
+
+def test_draw_failure_is_counted_not_raised():
+    """单个字符画不出来时只计数、继续画（最坏是个别字缺，不是整本书白翻）。"""
+    class _BoomPage:
+        def insert_text(self, *a, **kw):
+            raise RuntimeError("模拟字体取不到字宽")
+
+    mod.pt.reset_draw_failures()
+    assert mod.pt._insert_char(_BoomPage(), fitz.Point(20, 50), "中", 12,
+                              (0, 0, 0), 0, 0.0) is False
+    assert mod.pt.draw_failures()["chars"] == 1, mod.pt.draw_failures()
+    # 整串失败 → 逐字符重试 → 仍然不抛。计数按**字符数**：
+    #   1（单字 "中"）+ 2（整串 "中文"）+ 1 + 1（逐字重试）= 5
+    mod.pt._draw_text(_BoomPage(), fitz.Point(20, 50), "中文", 12, (0, 0, 0))
+    assert mod.pt.draw_failures()["chars"] == 5, mod.pt.draw_failures()
+    assert mod.pt.draw_failures()["errors"], "没有记录失败原因"
+    mod.pt.reset_draw_failures()
+    assert mod.pt.draw_failures()["chars"] == 0
+    print("    [计数] 画不出来的字被计数并继续：%r" % (mod.pt.draw_failures(),))
+
+
+def _load_fonts_module():
+    """按路径加载 pipelines/fonts.py（与管线同样的加载方式，避免包上下文问题）。"""
+    path = os.path.join(DOCBRIDGE, "pipelines", "fonts.py")
+    spec = importlib.util.spec_from_file_location("test_dbg_fonts", path)
+    fmod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = fmod
+    spec.loader.exec_module(fmod)
+    return fmod
+
+
+def test_font_candidate_selection_picks_first_drawable():
+    """候选按优先级取第一个**真的能画字**的；画不了字的被跳过；全不可用返回空。"""
+    fmod = _load_fonts_module()
+    good = mod.pt.CJK_FONTFILE or "/System/Library/Fonts/Supplemental/Songti.ttc"
+    assert os.path.isfile(good), good
+    saved = fmod.CJK_FONT_CANDIDATES
+    try:
+        fmod.CJK_FONT_CANDIDATES = ("/nonexistent/a.ttf", "/nonexistent/b.otf", good)
+        assert fmod.cjk_font_candidates() == [good]
+        assert fmod.usable_cjk_fonts(mod.pt.font_drawable) == [good]
+        assert fmod.default_pdf_font(mod.pt.font_drawable) == good
+        fmod.CJK_FONT_CANDIDATES = ("/nonexistent/a.ttf",)
+        assert fmod.usable_cjk_fonts(mod.pt.font_drawable) == []
+        assert fmod.default_pdf_font(mod.pt.font_drawable) == ""
+    finally:
+        fmod.CJK_FONT_CANDIDATES = saved
+    print("    [字体候选] 按优先级 + 真画字校验 + 全缺失返回空")
+
+
+def test_cjk_candidates_must_contain_han_characters():
+    """候选清单里每个可用的字体都必须**含汉字**。
+
+    DejaVu / Liberation 之类只有拉丁与符号的字体绝不能混进 CJK 候选
+    （否则整份中文会被画成空白/缺字框）。这条断言就是防这个。
+    """
+    fmod = _load_fonts_module()
+    checked = 0
+    for path in fmod.cjk_font_candidates():
+        if not mod.pt.font_drawable(path):
+            continue
+        font = fitz.Font(fontfile=path)
+        assert font.has_glyph(ord("中")), "%s 不含汉字，不能当 CJK 字体" % path
+        checked += 1
+    assert checked >= 1, "本机一个可用的中文字体都没有（候选清单：%r）" % (
+        fmod.cjk_font_candidates(),)
+    print("    [字体候选] %d 个候选字体均含汉字" % checked)
+
+
 # ------------------------------------------------------------------ 直接运行
 
 def main():

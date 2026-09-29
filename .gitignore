@@ -21,3 +21,6 @@ cf/build/
 .wrangler/
 cf/account/.dev.vars
 cf/account/.wrangler/
+
+# 本次验证的渲染对照图（供人工核对，不入库）
+_verify_2026fall/

@@ -29,6 +29,7 @@ import fitz  # PyMuPDF
 
 CJK_FONT = "china-s"  # 兜底字体（PyMuPDF 内嵌，无需外部文件）
 CJK_FONTFILE = None    # 检测到的系统字体（宋体等，拉丁为比例字形）
+CJK_FONT_NAME = None   # 选中字体的**字体名**（如 "AR PL UMing CN"），写日志/stats 用
 CJK_FONT_OBJ = None    # fitz.Font 对象（度量用）
 # 候选系统字体：优先宋体（正文衬线，拉丁比例）
 FONT_CANDIDATES = [
@@ -55,40 +56,89 @@ FALLBACK_CANDIDATES = [
 MISSING_CANDIDATES = ("–†‡•⇒⇔∂∇∉⊂⊇⋅∃∄∅∝∫∮≅∠∥⊥⊕⊗∑∏"
                       "∞≡≤≥≠≈±×÷°′″‰§¶←→↔↑↓⇒⇔∈∉⊂⊆⊇∪∩∀¬∧∨")
 _GLYPH_CACHE = {}
+_FONT_LOGGED = [None]   # 上次打印过的字体组合（OCR 每页都会 init，避免刷屏）
+
+
+def _first_drawable(candidates):
+    """按优先级返回第一个**真的能画字**的字体文件；都不行返回 None。
+
+    这里刻意用 ``font_drawable()``（真的在临时页上 insert 一个字）而不是
+    ``fitz.Font(fontfile=)``：线上那份 PDF 暴露的正是"能加载、取不到字宽"的字体，
+    只判断能不能构造对象是不够的。
+    """
+    for path in candidates or ():
+        if path and os.path.isfile(path) and font_drawable(path):
+            return path
+    return None
+
+
+def _font_display_name(path):
+    """字体名（用于日志/stats）；取不到就回退成文件名。"""
+    try:
+        return fitz.Font(fontfile=path).name or os.path.basename(path)
+    except Exception:                       # noqa: BLE001
+        return os.path.basename(path)
 
 
 def init_cjk_font(font_spec="auto"):
-    """初始化中文字体。font_spec: auto | china-s | 字体文件路径。"""
-    global CJK_FONT, CJK_FONTFILE, CJK_FONT_OBJ
+    """初始化中文字体。font_spec: auto | china-s | 字体文件路径。
+
+    ★ 选字体的判据是「**真的能画字**」（``font_drawable``：在临时页上 insert 一个
+    汉字），不是「能构造 fitz.Font」。线上真实崩溃就是能加载、但取不到字宽的字体
+    导致的；这里逐候选校验，全部不可用时退回内置 china-s 并**明确打日志**，
+    绝不静默产出乱码/空白。
+    """
+    global CJK_FONT, CJK_FONTFILE, CJK_FONT_NAME, CJK_FONT_OBJ
     global FALLBACK_FONTFILE, FALLBACK_FONT_OBJ
+    chosen = None
     if font_spec == "china-s":
-        CJK_FONT, CJK_FONTFILE = "china-s", None
+        chosen = None
     elif font_spec == "auto":
+        chosen = _first_drawable(FONT_CANDIDATES)
+    else:
+        if font_drawable(font_spec):
+            chosen = font_spec
+        else:
+            # 指定字体不可用（例如配置指向了一份取不到字宽的字体 / CFF 集合）
+            # → 优雅降级：退回候选清单里第一个能画字的。宁可换个字体，也不要崩。
+            print("[warn] 指定中文字体不可用（取不到字宽）：%s；改从候选清单里选"
+                  % (font_spec,), file=sys.stderr)
+            chosen = _first_drawable(FONT_CANDIDATES)
+    if chosen:
+        CJK_FONT, CJK_FONTFILE = "F0", chosen
+    else:
         CJK_FONT, CJK_FONTFILE = "china-s", None
-        for p in FONT_CANDIDATES:
-            if os.path.isfile(p):
-                try:
-                    fitz.Font(fontfile=p)
-                    CJK_FONT, CJK_FONTFILE = "F0", p
-                    break
-                except Exception:
-                    continue
-    else:  # 显式路径
-        CJK_FONT, CJK_FONTFILE = "F0", font_spec
+        if font_spec != "china-s":
+            print("[warn] 候选清单里没有可用字体，退回内置 china-s"
+                  "（字形正常，但译文复制/搜索可能是乱码，建议检查系统字体）",
+                  file=sys.stderr)
     if CJK_FONTFILE:
         CJK_FONT_OBJ = fitz.Font(fontfile=CJK_FONTFILE)
     else:
         CJK_FONT_OBJ = fitz.Font(CJK_FONT)
-    # 回退字体：Arial Unicode（数学符号全覆盖）
+    CJK_FONT_NAME = _font_display_name(CJK_FONTFILE) if CJK_FONTFILE else "china-s（内嵌）"
+    # 回退字体：Arial Unicode / DejaVu 等（数学符号全覆盖）。
+    # 同样逐个校验"能不能真的画字"：坏字体在这里就被刷掉，而不是画到一半崩。
     FALLBACK_FONTFILE = FALLBACK_FONT_OBJ = None
     for p in FALLBACK_CANDIDATES:
-        if os.path.isfile(p):
-            try:
-                FALLBACK_FONT_OBJ = fitz.Font(fontfile=p)
-                FALLBACK_FONTFILE = p
-                break
-            except Exception:
-                continue
+        if os.path.isfile(p) and font_drawable(p):
+            FALLBACK_FONT_OBJ = fitz.Font(fontfile=p)
+            FALLBACK_FONTFILE = p
+            break
+    # 字体信息打日志（OCR 管线每页都会调一次 init，这里做去重，别刷屏）
+    key = (CJK_FONTFILE, CJK_FONT_NAME, FALLBACK_FONTFILE)
+    if _FONT_LOGGED[0] != key:
+        _FONT_LOGGED[0] = key
+        if CJK_FONTFILE:
+            print("[font] 中文字体: %s（%s）" % (CJK_FONTFILE, CJK_FONT_NAME))
+        else:
+            print("[font] 中文字体: china-s（内嵌兜底，无系统中文 TrueType 字体）")
+        if FALLBACK_FONTFILE:
+            print("[font] 缺字回退字体: %s（%s）"
+                  % (FALLBACK_FONTFILE, _font_display_name(FALLBACK_FONTFILE)))
+        else:
+            print("[warn] 没有可用的缺字回退字体：缺字（∂ ∆ ⊂ 等）会画成空白",
+                  file=sys.stderr)
     _GLYPH_CACHE.clear()
 
 
@@ -414,30 +464,145 @@ def _is_cjk(ch):
     return "\u4e00" <= ch <= "\u9fff"
 
 
+# ------------------------------------------------- 字体资源名与绘制容错
+# 线上真实崩溃（run 36553098760）：源 PDF 自带 /F1，且该字体**没有内嵌文件**；
+# PyMuPDF 的 insert_text(fontname="F1", fontfile=...) 会**按名字复用**页面上已有的
+# 字体（见 pymupdf.Page.insert_font 里的 CheckFont），于是走到
+# doc.get_char_widths(坏字体) → None.m_internal → AttributeError，整本书白翻。
+# 修法：我们注册的字体一律用「该页上不存在」的资源名（DSH0/DSH1/…），
+# 彻底躲开源文档的 /F0 /F1 /F2 命名习惯（PowerPoint 导出的 PDF 大量使用）。
+_FONT_NAMES: dict = {}          # id(page) -> (page, {字体文件: 资源名}, 已占用的名字集合)
+_FONT_NAMES_MAX = 6             # 只留最近几页，避免长期持有整页对象
+_FONT_NAME_BASE = "DSH"
+
+# 绘制失败统计（任务级）：个别字符画不出来**不抛异常**，计数后继续，
+# 由管线在任务末尾写进 stats/日志 —— 最坏是"个别字缺"，不是"整本书白翻"。
+_DRAW_FAIL = {"chars": 0, "errors": []}
+_DRAW_FAIL_MSG_LIMIT = 5
+_DRAWABLE_CACHE: dict = {}      # 字体文件 -> 能不能真的画字（一次任务只探测一次）
+
+
+def reset_draw_failures():
+    """开始一份新任务前清零绘制失败计数（管线在每次 run 开头调用）。"""
+    _DRAW_FAIL["chars"] = 0
+    _DRAW_FAIL["errors"] = []
+
+
+def draw_failures() -> dict:
+    """本任务绘制失败的统计：``{'chars': 未画出的字符数, 'errors': [前几条原因]}``。"""
+    return {"chars": _DRAW_FAIL["chars"], "errors": list(_DRAW_FAIL["errors"])}
+
+
+def _note_draw_failure(text, exc):
+    """记一次绘制失败并继续；前几条打到 stderr，便于线上排查。"""
+    _DRAW_FAIL["chars"] += len(text or "")
+    if len(_DRAW_FAIL["errors"]) < _DRAW_FAIL_MSG_LIMIT:
+        _DRAW_FAIL["errors"].append("%r: %s" % ((text or "")[:12], exc))
+        print("  [warn] 有字符画不出来（已跳过并继续）：%r -> %s"
+              % ((text or "")[:12], exc), file=sys.stderr)
+    return False
+
+
+def _font_res_name(page, path):
+    """取该页上给字体文件 ``path`` 用的**不重名**资源名（见上面崩溃说明）。
+
+    结果按页缓存：同一页同一字体只算一次；页面上已存在的字体名（例如源 PDF 的
+    /F1）不会被我们占用。
+    """
+    key = id(page)
+    hit = _FONT_NAMES.get(key)
+    if hit is None or hit[0] is not page:
+        try:
+            used = {f[4] for f in page.get_fonts(full=True)}
+        except Exception:                  # noqa: BLE001 —— 取不到就当没有已用名
+            used = set()
+        hit = (page, {}, used)
+        if len(_FONT_NAMES) >= _FONT_NAMES_MAX:
+            _FONT_NAMES.clear()
+        _FONT_NAMES[key] = hit
+    cache, used = hit[1], hit[2]
+    name = cache.get(path)
+    if name:
+        return name
+    k = 0
+    name = "%s%d" % (_FONT_NAME_BASE, k)
+    while name in used:
+        k += 1
+        name = "%s%d" % (_FONT_NAME_BASE, k)
+    used.add(name)
+    cache[path] = name
+    return name
+
+
+def font_drawable(path) -> bool:
+    """这个字体文件能不能**真的用来画字**（不只是能构造 fitz.Font）。
+
+    线上那份 PDF 暴露的是"能加载、但取不到字宽"的字体；只做 ``fitz.Font(fontfile=)``
+    是不够的，必须在一张临时页上真的 insert 一个字。返回 True/False，不抛异常。
+    结果按路径缓存：一次任务里同一字体只探测一次。
+    """
+    if not path:
+        return False
+    hit = _DRAWABLE_CACHE.get(path)
+    if hit is not None:
+        return hit
+    ok = False
+    try:
+        probe = fitz.open()
+        try:
+            page = probe.new_page()
+            page.insert_text(fitz.Point(20, 40), "中", fontname="DBPROBE0",
+                             fontfile=path, fontsize=10)
+            ok = True
+        finally:
+            probe.close()
+    except Exception:                       # noqa: BLE001
+        ok = False
+    _DRAWABLE_CACHE[path] = ok
+    return ok
+
+
 def _insert_char(page, pt, text, size, color, render_mode, border_width):
-    """插入文本（单字符缺字时用回退字体；整段文本走主字体）。"""
+    """插入文本（单字符缺字时用回退字体；整段文本走主字体）。
+
+    与旧版的两点区别（都是为了线上那次真实崩溃）：
+      * 字体资源名一律走 ``_font_res_name()``，绝不与源 PDF 已有的 /F0 /F1 重名；
+      * 单个字符画失败**不往上抛**，计数后继续（见 ``draw_failures()``）。
+    """
     if len(text) == 1 and _needs_fallback(text):
-        page.insert_text(pt, text, fontname="F1", fontfile=FALLBACK_FONTFILE,
-                         fontsize=size, color=color,
-                         render_mode=render_mode, border_width=border_width,
-                         overlay=True)
+        fontfile, fontname = FALLBACK_FONTFILE, _font_res_name(page, FALLBACK_FONTFILE)
     elif CJK_FONTFILE:
-        page.insert_text(pt, text, fontname=CJK_FONT, fontfile=CJK_FONTFILE,
-                         fontsize=size, color=color,
-                         render_mode=render_mode, border_width=border_width,
-                         overlay=True)
+        fontfile, fontname = CJK_FONTFILE, _font_res_name(page, CJK_FONTFILE)
     else:
-        page.insert_text(pt, text, fontname=CJK_FONT, fontsize=size,
-                         color=color, render_mode=render_mode,
-                         border_width=border_width, overlay=True)
+        fontfile, fontname = None, CJK_FONT
+    try:
+        if fontfile:
+            page.insert_text(pt, text, fontname=fontname, fontfile=fontfile,
+                             fontsize=size, color=color,
+                             render_mode=render_mode, border_width=border_width,
+                             overlay=True)
+        else:
+            page.insert_text(pt, text, fontname=fontname, fontsize=size,
+                             color=color, render_mode=render_mode,
+                             border_width=border_width, overlay=True)
+        return True
+    except Exception as exc:                # noqa: BLE001
+        return _note_draw_failure(text, exc)
 
 
 def _draw_text(page, pt, text, size, color, render_mode=0, border_width=0.0):
-    """整串绘制：含缺字时按字形分段（CJK 段用主字体，缺字单画用回退字体）。"""
+    """整串绘制：含缺字时按字形分段（CJK 段用主字体，缺字单画用回退字体）。
+
+    整串插入失败时**逐字符重试**：宁可只丢掉画不出来的那一个字，
+    也不要让一行（更不要让整本书）因为一个坏字形而失败。
+    """
     if not text:
         return
     if not any(_needs_fallback(c) for c in text):
-        _insert_char(page, pt, text, size, color, render_mode, border_width)
+        if _insert_char(page, pt, text, size, color, render_mode, border_width):
+            return
+        _draw_chars_individually(page, pt, text, size, color, render_mode,
+                                 border_width)
         return
     x = pt.x
     buf = ""
@@ -456,6 +621,16 @@ def _draw_text(page, pt, text, size, color, render_mode=0, border_width=0.0):
     if buf:
         _insert_char(page, fitz.Point(x, pt.y), buf, size, color,
                      render_mode, border_width)
+
+
+def _draw_chars_individually(page, pt, text, size, color, render_mode,
+                             border_width):
+    """逐字符兜底绘制：失败的字不再重试，只计数（避免死循环与整体失败）。"""
+    x = pt.x
+    for ch in text:
+        _insert_char(page, fitz.Point(x, pt.y), ch, size, color,
+                     render_mode, border_width)
+        x += text_width(ch, size)
 
 
 def _justify_plan(line, size, width):
