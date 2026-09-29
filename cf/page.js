@@ -134,7 +134,7 @@ export const PAGE = `<!DOCTYPE html>
     <!-- 公共文件区：只有 VIP / 管理员可见（见 checkAuth；服务端 /api/community 还会再判一次角色） -->
     <div class="card hidden" id="commcard">
       <h2>公共文件</h2>
-      <p class="muted" id="commnote">别人翻译好的文件，VIP 及以上可以直接下载。</p>
+      <p class="muted" id="commnote">别人翻译好的文件，VIP 及以上可以直接下载。只显示 3 天内的译文。</p>
       <div class="tablewrap">
         <table class="comm">
           <thead>
@@ -155,6 +155,8 @@ var pw = sessionStorage.getItem('aurora_pw') || '';
 var authed = false;          // 已通过登录或管理口令验证
 var canRefine = false;       // 当前账号有没有「精修」能力（由 /api/me 决定）
 var role = '';               // 当前账号角色：user / vip / admin（公共文件区是否可见看它）
+// 公共区只列 3 天内的译文（译文存储只留 3 天，更早的点下载只会 410），说明文案跟 HTML 里那句保持一致
+var COMM_NOTE = '别人翻译好的文件，VIP 及以上可以直接下载。只显示 3 天内的译文。';
 var polling = null;
 var elapsedBase = 0;     // 服务端给的已用秒数
 var lastJob = null;      // 最近一次状态，供本地秒表使用
@@ -428,13 +430,13 @@ function loadCommunity() {
     rows.innerHTML = '';
     if (!d.files || !d.files.length) {
       $('commempty').classList.remove('hidden');
-      $('commnote').textContent = '别人翻译好的文件，VIP 及以上可以直接下载。';
+      $('commnote').textContent = COMM_NOTE;
       return;
     }
     $('commempty').classList.add('hidden');
     $('commnote').textContent = d.truncated
-      ? '只列了最近 ' + d.limit + ' 个文件，更早的没有显示。'
-      : '别人翻译好的文件，VIP 及以上可以直接下载。';
+      ? '只列了最近 ' + d.limit + ' 个文件，更早的没有显示。只显示 3 天内的译文。'
+      : COMM_NOTE;
     d.files.forEach(function (f) {
       var tr = document.createElement('tr');
 

@@ -48,8 +48,19 @@ const COMMUNITY_SCAN = 500; // 最多扫这么多条任务记录（KV 读次数�
  */
 const SMOKE_NAME_RE = /^smoke[-_]/i;
 
-function isSmokeJob(job) {
-  return SMOKE_NAME_RE.test(String((job && job.name) || "").trim());
+/**
+ * 这是不是自动化/自检产生的任务（公共文件区要把它挡在外面）。
+ *
+ * 两条信号取"或"，互为兜底：
+ *   ① 名字以 smoke- / smoke_ 开头 —— 现在的自检脚本就是这么起名的；
+ *   ② 任务没有 userId —— 上传走的是管理口令通道（只有自动化与应急才会这么干），
+ *      真人从网页登录上传的任务一定带 userId（见 handleUpload 里的 userId 赋值）。
+ * 光靠①，脚本哪天换个文件名就漏进来了；光靠②，管理员手动用口令传的文件也会被当成自检。
+ * 合起来才稳。注意②不会误伤真人：正常登录用户的任务永远有 userId。
+ */
+function isAutomationJob(job) {
+  if (SMOKE_NAME_RE.test(String((job && job.name) || "").trim())) return true;
+  return !(job && job.userId);
 }
 
 /**
@@ -383,12 +394,17 @@ async function adoptRun(env, jobId) {
  *   ① 登录会话 —— 正常路径，读取 D1 里的会话，顺带核对本月额度
  *   ② 管理口令 —— 自动化线上自检与应急通道（不占任何人额度）
  * 返回 { user } / { admin: true } / { error }
+ *
+ * opts.skipQuota：跳过"本月额度用完"这道门。
+ *   为什么需要：看/下别人已经译好的成品不花一分钱 API 额度，被 402 拦住没有道理。
+ *   默认 false —— 上传、查进度、看历史的额度判定一个字节都不变。
  */
-async function authorizeUser(request, env, url) {
+async function authorizeUser(request, env, url, opts = {}) {
   if (env.DB) {
     try {
       const user = await currentUser(env, request);
       if (user) {
+        if (opts.skipQuota) return { user };
         const q = quotaState(user);
         if (!q.unlimited && q.remaining <= 0) {
           return { user, error: `本月额度已用完（已用 ${q.used}/${q.quota} 页），下个月自动恢复，或找管理员加额度` };
@@ -608,7 +624,8 @@ async function handleStatus(request, env, url) {
 }
 
 async function handleDownload(request, env, url) {
-  const auth = await authorizeUser(request, env, url);
+  // skipQuota：下载已经译好的成品不再消耗额度，别让"额度用完了"拦着人取自己的文件
+  const auth = await authorizeUser(request, env, url, { skipQuota: true });
   if (auth.error) return fail(auth.error, 401);
   const id = url.searchParams.get("id");
   let job = await readJob(env, id);
@@ -785,12 +802,13 @@ async function handleHistory(request, env, url) {
  *   history 是"我的任务"，里面有进行中、失败的条目和 note；公共区只该有做好的成品。
  *   两者语义、权限都不同，混在一个接口里，早晚会顺手把别人的过程细节漏出去。
  *
- * ★ 为什么排除冒烟任务：.github/workflows/smoke.yml 每次线上自检都会真上传一个样例文件，
- *   它跟用户文档混在一起会让公共区变成"测试垃圾场"（而且它走口令通道，没有上传者）。
+ * ★ 为什么排除自动化产物：.github/workflows/smoke.yml 每次线上自检都会真上传一个样例文件，
+ *   它跟用户文档混在一起会让公共区变成"测试垃圾场"。判断见 isAutomationJob。
  */
 async function handleCommunity(request, env, url) {
-  const auth = await authorizeUser(request, env, url);
-  if (auth.error) return fail(auth.error, auth.user ? 402 : 401);
+  // skipQuota：看列表不花额度，额度用完的 VIP 也该能逛（下载同理，见 handleDownload）
+  const auth = await authorizeUser(request, env, url, { skipQuota: true });
+  if (auth.error) return fail(auth.error, 401);
   const role = authRole(auth);
   if (role !== "vip" && role !== "admin") {
     const who = ROLE_LABEL[role] || "当前账号";
@@ -820,7 +838,7 @@ async function handleCommunity(request, env, url) {
     const batch = await Promise.all(keys.slice(i, i + 20).map((k) => env.JOBS.get(k, "json")));
     for (const job of batch) {
       if (!job || job.status !== "done" || !job.resultChunks) continue;
-      if (isSmokeJob(job)) continue;                          // 自动化自检的产物不进公共区
+      if (isAutomationJob(job)) continue;                     // 自动化/自检的产物不进公共区
       const finishedAt = Number(job.doneAt || job.createdAt || 0);
       // 译文分块只留 3 天（BLOB_TTL），记录却留 7 天。过了 3 天的条目点下载只会拿到 410，
       // 与其让人白点一次，不如不进列表。
