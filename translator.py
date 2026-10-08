@@ -969,12 +969,11 @@ def _soft_reason(values: list[str], sources: list[str], target: str, kind: str,
 
     只查两件事，且**一发现就返回**（每批最多多花一次请求）：
 
-    1. **数字整个丢了**——技术/金融文档里被吃掉的数字是最严重的隐蔽错误，
-       而原来的硬校验只看了数学符号，完全没看数字（``Revenue was $1,234,567``
-       译成「收入很高」是能过校验的）。判定用「一个字面数字都没有、也没有
-       中文数字」这个很紧的条件，所以「百分之五十」「第2章」都不会误判。
-    2. **术语表没被遵守**——提示词里明明写了 "must be followed"，
-       但从来没人检查过。这里只查本批真的注入过、且够具体的术语。
+    1. **数字整个丢了**（逐行判）——技术/金融文档里被吃掉的数字是最严重的隐蔽
+       错误，而原来的硬校验只看了数学符号，完全没看数字（``Revenue was
+       $1,234,567`` 译成「收入很高」是能过校验的）。判定用「一个字面数字都没有、
+       也没有中文数字」这个很紧的条件，所以「百分之五十」「第2章」都不会误判。
+    2. **术语表整段没被遵守**（**按整段判，不逐行**）——理由见下面 ★。
     """
     if len(values) != len(sources):
         return ""
@@ -983,12 +982,25 @@ def _soft_reason(values: list[str], sources: list[str], target: str, kind: str,
         if want and not (_numbers(v) & want) and not CN_NUM_RE.search(v):
             return (f"第 {idx} 条疑似丢失数字（原文有 {'、'.join(sorted(want)[:3])}，"
                     f"译文里找不到）：{v[:30]!r}")
-        for en, zh in (terms or []):
+    # ★ 术语这一条**必须按整段判，不能逐行**。
+    #   译文是整段翻完、再按原行的行盒宽度切回每一行的（见
+    #   pdf_inplace._split_translation），所以单独一行里当然可能找不到那个词——
+    #   「消费者」正好被切到了下一行。
+    #   实测（真实教材缓存，10 个批次）：逐行判触发 5 个，**全是误报**——
+    #     · `substitute → 替代品`：译文写的是「用一种商品替代另一种商品」，词用了，
+    #       只是词性不同；
+    #     · `consumer → 消费者`：整段译文里明明有，只是没落在这一行。
+    #   而每误报一次就要多打一次模型，直接让整本书变慢、变贵。改成整段判之后，
+    #   同样 10 个批次触发 0 个，仍然兜得住「整批完全无视术语表」的情况。
+    if terms:
+        joined_v = " ".join(values)
+        joined_s = " ".join(sources)
+        for en, zh in terms:
             zh = str(zh)
             if len(zh) < 2 or len(str(en)) < GLOSSARY_ENFORCE_MIN_LEN:
                 continue
-            if zh not in v and _term_present(en, s):
-                return f"第 {idx} 条未使用约定的术语「{en} → {zh}」：{v[:30]!r}"
+            if zh not in joined_v and _term_present(en, joined_s):
+                return f"整段译文未使用约定的术语「{en} → {zh}」"
     return ""
 
 

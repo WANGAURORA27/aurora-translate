@@ -904,6 +904,28 @@ def test_soft_hint_is_not_worded_as_rejection():
     check("hard_hint_still_rejected", "rejected" in hard, hard)
 
 
+def test_soft_term_check_is_batch_level_not_per_line():
+    """术语遵守度必须**按整段**判：译文是整段翻完再按行盒宽度切回各行的，
+    单独一行里找不到那个词很正常（「消费者」被切到了下一行）。
+
+    ★ 回归保护：逐行判在真实教材缓存上误报率约 50%（实测 10 个批次触发 5 个，
+      全是误报），而每误报一次就多打一次模型 —— 直接让整本书变慢、变贵。
+      这个坑上过一次线，别再踩。
+    """
+    terms = [("indifference curve", "无差异曲线")]        # 15 字符，过得了长度门槛
+    sources = ["The indifference curve shows utility.",
+               "A second line of the same paragraph."]
+    # 「无差异曲线」落在**第二行**的译文里：逐行判会误报，整段判不该报
+    values = ["这条曲线表示效用。", "这才是无差异曲线的含义。"]
+    check("soft_term_batch_level_no_false_alarm",
+          T._soft_reason(values, sources, "zh-Hans", "line", terms) == "",
+          T._soft_reason(values, sources, "zh-Hans", "line", terms))
+    # 整段里真的一个都没有 → 该报
+    values2 = ["这条曲线表示效用。", "这是表示含义的。"]
+    check("soft_term_batch_level_catches_real_miss",
+          "术语" in T._soft_reason(values2, sources, "zh-Hans", "line", terms))
+
+
 if __name__ == "__main__":
     for fn in [v for k, v in sorted(globals().items()) if k.startswith("test_")]:
         fn()
