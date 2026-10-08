@@ -814,6 +814,96 @@ def test_refine_prompt_template_has_all_placeholders():
           prompt[:80])
 
 
+# ---------------------------------------------- 术语复数 / 繁体表 / 软校验（回归保护）
+
+def test_glossary_matches_plural_forms_but_keeps_word_boundary():
+    """术语的词边界正则要认得复数，又不能松到让 firm 命中 confirm。
+
+    ★ 回归保护：原来 ``(?<![A-Za-z])firm(?![A-Za-z])`` 匹配不到 "firms" ——
+      firm 后面跟着 s，正好被 ``(?![A-Za-z])`` 挡掉。而教材里复数往往比单数还
+      常见，术语表等于在复数段落上整片失效：该统一的词反而最不统一。
+    """
+    g = {"firm": "厂商", "market": "市场", "opportunity cost": "机会成本"}
+    hits = dict(T._glossary_hits({"glossary": g},
+                                 ["Firms enter the market.", "Opportunity costs matter."]))
+    check("glossary_plural_hit", hits.get("firm") == "厂商", hits)
+    check("glossary_plural_market", hits.get("market") == "市场", hits)
+    check("glossary_multiword_plural", hits.get("opportunity cost") == "机会成本", hits)
+    only = dict(T._glossary_hits({"glossary": {"firm": "厂商"}}, ["Please confirm this."]))
+    check("glossary_word_boundary_intact", "firm" not in only, only)
+
+
+def test_traditional_detection_catches_leaks_without_false_positives():
+    """繁体检测：常见泄漏要抓到，简体（含 干/后/里/台/只/系 这类两用字）不能误判。
+
+    ★ 回归保护：原来只收了 19 个手挑的字（繁體臺灣與後們這裡個當髮幹），
+      經濟 學 價 譯 這 一批最常泄漏的字全都不在里面。
+    """
+    for s in ["這是問題", "經濟學的價值", "資產負債表", "會議記錄", "營業收入", "風險管理"]:
+        check("trad_caught_" + s, T.TRAD_RE.search(s) is not None, s)
+    for s in ["这是经过经济学分析的价值。", "后半天才开始，里面有几个问题要处理。",
+              "平台上的系里发了一份历史资料，云服务也在复刻。",
+              "干货和谷子都冲进了市场，余下的于本月处理。",
+              "繁体字本身是合法的简体用词。"]:
+        check("simplified_not_flagged", T.TRAD_RE.search(s) is None, s)
+
+
+def test_soft_reason_flags_dropped_numbers():
+    """数字整个丢了要能被发现（硬校验只管数学符号，从来不管数字）。"""
+    r = T._soft_reason(["收入很高"], ["Revenue was $1,234,567"], "zh-Hans", "line")
+    check("soft_number_dropped", "数字" in r, r)
+    check("soft_number_kept",
+          T._soft_reason(["收入为 1,234,567 美元"], ["Revenue was $1,234,567"],
+                         "zh-Hans", "line") == "")
+    check("soft_cn_numerals_ok",
+          T._soft_reason(["收入为一百二十三万"], ["Revenue was $1,234,567"],
+                         "zh-Hans", "line") == "")
+    check("soft_single_digit_ignored",
+          T._soft_reason(["第二章"], ["Chapter 2"], "zh-Hans", "line") == "")
+
+
+def test_soft_reason_enforces_only_specific_terms():
+    """术语遵守度只对「够具体」的术语强制：短词会误伤。
+
+    capital 在 "the capital of France" 里本来就该译「首都」，
+    硬按术语表逼成「资本」反而错 —— 所以短词只做提示、不做校验。
+    """
+    terms = [("opportunity cost", "机会成本"), ("cost", "成本")]
+    check("soft_term_violated",
+          "术语" in T._soft_reason(["成本很重要"], ["Opportunity cost matters."],
+                                   "zh-Hans", "line", terms))
+    check("soft_term_followed",
+          T._soft_reason(["机会成本很重要"], ["Opportunity cost matters."],
+                         "zh-Hans", "line", terms) == "")
+    check("soft_short_term_not_enforced",
+          T._soft_reason(["价格变了"], ["The cost changed."],
+                         "zh-Hans", "line", terms) == "")
+
+
+def test_soft_check_never_discards_a_valid_translation():
+    """软校验只该多花一次请求，绝不能让一条正确的译文退回原文。
+
+    ★ 这是软校验存在的全部理由。硬校验判错会一路降级
+      （换通道 → 分组重试 → 逐条重试 → 保留原文），所以「数字丢了 / 术语没遵守」
+      这种「大概率错、但个别情况也说得通」的问题只能提示，不能否决。
+    """
+    def fake(n, user):
+        return '{"1": "收入很高。"}'          # 永远丢数字 → 软校验每次都不过
+
+    out, calls, stats = run_with_fake(fake, ["Revenue was $1,234,567 in total."])
+    check("soft_keeps_translation", out == ["收入很高。"], out)
+    check("soft_retried_exactly_once", len(calls) == 2, len(calls))
+    check("soft_counted", stats.get("soft_retries") == 1, stats.get("soft_retries"))
+
+
+def test_soft_hint_is_not_worded_as_rejection():
+    """软提示不能说成「你被拒了」——否则模型会把本来正确的译文也一并改掉。"""
+    soft = T._correction_hint("第 1 条未使用约定的术语「opportunity cost → 机会成本」", soft=True)
+    hard = T._correction_hint("第 1 条含繁体字：'這裡'")
+    check("soft_hint_not_rejected", "rejected" not in soft and "accepted" in soft, soft)
+    check("hard_hint_still_rejected", "rejected" in hard, hard)
+
+
 if __name__ == "__main__":
     for fn in [v for k, v in sorted(globals().items()) if k.startswith("test_")]:
         fn()

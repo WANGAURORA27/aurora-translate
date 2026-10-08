@@ -38,7 +38,7 @@ MAX_ATTEMPTS = 3
 
 # 提示词/校验规则的版本号：**改动提示词或校验逻辑时必须 +1**。
 # 它会进跨任务共享缓存的键——否则改了提示词，旧文件重跑仍命中旧译文。
-PROMPT_VERSION = "2026-09-11.1"
+PROMPT_VERSION = "2026-10-08.1"
 
 # 数学符号保全：源文里有这些符号时，译文必须保留符号本身**或**约定俗成的中文说法
 # （√ 写成「根号」当然也是对的，不能因此判错——这是之前"重复=合并"那条规则踩过的坑）。
@@ -110,7 +110,36 @@ def _is_rate_limited(exc: BaseException) -> bool:
 NUMBERISH_RE = re.compile(r"^[\d\s\W_]*$")           # 纯数字/符号/空白
 LATIN_RE = re.compile(r"[A-Za-z]")
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
-TRAD_RE = re.compile(r"[繁體臺灣與後們這裡個當髮幹]")   # 常见繁体专有字（简繁判断用）
+# 繁体专用字（简繁判断用）——判断「译文里混进繁体」时只看这张表。
+#
+# 收录标准是「**这个字本身只属于繁体**」：要么简体写法不同（經/经、產/产、價/价），
+# 要么它本来就是繁体专有字形（裡/里、隻/只、曆/历、捲/卷）。
+#
+# ★ 刻意**不收**这些「简体也在用」的字：
+#     干 后 里 台 面 只 系 划 历 云 复 发 卷 谷 冲 余 郁 繁 …
+#   收了会把正常的简体译文误判成繁体，而误判的代价是整批被打回重译，
+#   甚至降级成「保留原文」——比漏判严重得多。所以只求覆盖常见泄漏，不求穷尽。
+#   同理不收 於（简体里偶有出现）与 係。
+_TRAD_CHARS = (
+    # 高频功能字与最常泄漏的一批
+    "這個們來時說對會後國開問間關與為應麼樣號據處條種類總計認識試題課讀語詞讓變邊進運選過適遞"
+    "該誰隨雖歲雙書術樹實勢設紹審聲勝濕釋飾壽順碩絲鬆蘇訴傳偉內決況淨涼減軍創別辦廠厭嗎場堅"
+    "備媽寶宮寬層師幫張徑戰戶擇掛揮標殘畢澤測濃漲漸滾靈災煩愛畫蓋筆簡紅約級紀納紙線織終統績"
+    "綠職藍補規視覺訂訪評話請調談燈點電霧靜頂頁車東萬專參倉嘗徹塵陳稱懲遲衝醜瘡純辭聰從叢錯"
+    # 经济、金融与商科高频
+    "經濟學譯產資價現發體圖債貨貨幣銀錢財務險報潤損虧額營業銷費稅貸儲匯兌換賬帳記購販賣買償"
+    "賺質貝負貢責敗貪貴贏鐘鋼鐵針錯鍵遺預領頻題項須風飛驗黃"
+    # 常用动词、形容词与名词
+    "達帶單擔膽當黨蕩導島鄧敵惡罰閥豐風馮婦復複剛岡鞏溝構穀顧觀館慣廣歸漢轟壺護劃懷壞歡環還"
+    "穢渾夥獲擊機積極際劑繼艱殲揀檢見劍鍵講獎將膠階節潔結緊僅盡驚競舊劇懼捲凱殼墾懇誇塊擴臘"
+    "蘭攔欄爛勞樂淚離裡禮麗歷曆厲勵連憐聯練煉糧兩輛療遼獵臨鄰嶺劉婁樓陸錄慮亂論羅絡駱馬邁麥"
+    "滿貓夢滅憫畝惱腦擬釀聶寧農瘧歐嘔盤龐賠噴貧頻憑撲僕樸譜齊騎豈氣棄遷簽淺譴槍牆強搶鍬橋竅"
+    "竊親輕慶瓊窮區驅權勸確擾熱榮軟銳灑傘喪掃澀殺臺態攤壇嘆湯濤討騰題鐵聽廳頭塗團橢窪襪彎網"
+    "韋違圍維衛溫聞穩務霧誤犧習戲細蝦嚇鹹獻縣憲鄉詳響蕭銷曉嘯協挾攜脅寫謝鋅興須許緒續懸學尋"
+    "詢訓訊遜壓亞啞嚴巖鹽陽養謠藥爺業葉醫億義議藝憶癰擁傭踴憂優郵猶遊誘餘漁嶼籲鬱譽淵園員圓"
+    "緣遠願躍嶽雲鄭證隻幟製質種眾晝硃燭築莊裝壯狀準濁鑽組採櫃捨裏幹髮"
+)
+TRAD_RE = re.compile("[" + _TRAD_CHARS + "]")
 ELLIPSIS_RE = re.compile(r"……|…|\.\.\.|。。。")
 META_RE = re.compile(
     r"原文未提供|保持原样|无法翻译|未提供原文|此处省略|翻译如下|译文[:：]|原文[:：]"
@@ -715,7 +744,40 @@ def load_glossary(explicit: str | None = None) -> dict:
 _GLOSSARY_RE_CACHE: dict = {}
 
 
-def _glossary_pattern(key: str):
+def _en_plural(word: str) -> str:
+    """英文名词的规则复数。
+
+    术语表里都是普通名词，规则变化够用。**刻意不猜不规则复数**
+    （index→indices、analysis→analyses）：猜错会往提示词里塞一个不存在的词，
+    比漏掉更糟。宁可漏，不可错。
+    """
+    low = word.lower()
+    if low.endswith(("s", "x", "z", "ch", "sh")):
+        return word + "es"
+    if len(word) > 1 and low.endswith("y") and low[-2] not in "aeiou":
+        return word[:-1] + "ies"
+    return word + "s"
+
+
+def _glossary_variants(key: str) -> tuple:
+    """术语的匹配变体：原形 + 规则复数。
+
+    ★ 为什么必须加复数：教材里 ``firms`` / ``markets`` / ``costs`` 出现的次数
+      往往比单数还多，而原来的词边界正则 ``(?<![A-Za-z])firm(?![A-Za-z])``
+      匹配不到 ``firms`` —— firm 后面跟着 s，正好被 ``(?![A-Za-z])`` 挡掉。
+      结果是术语表在**复数段落上整片失效**：该被统一的词反而最不统一。
+      示例里 ``firm → 厂商`` 这类规则，在真实教材上有一大半是白给的。
+    """
+    if not key:
+        return ()
+    if " " in key or "-" in key:
+        # 多词术语只把**最后一个词**变复数：marginal cost → marginal costs
+        cut = max(key.rfind(" "), key.rfind("-"))
+        return (key, key[:cut + 1] + _en_plural(key[cut + 1:]))
+    return (key, _en_plural(key))
+
+
+def _glossary_pattern(key: str, variants: tuple):
     """单词类术语的「按词边界匹配」正则，编译结果缓存起来。
 
     术语表有 800+ 条时，每批都要跑 800 多次匹配；Python 自带的正则缓存只有
@@ -723,18 +785,58 @@ def _glossary_pattern(key: str):
     """
     pat = _GLOSSARY_RE_CACHE.get(key)
     if pat is None:
-        pat = re.compile(r"(?<![A-Za-z])" + re.escape(key) + r"(?![A-Za-z])", re.I)
+        body = "|".join(re.escape(v) for v in variants)
+        pat = re.compile(r"(?<![A-Za-z])(?:" + body + r")(?![A-Za-z])", re.I)
         _GLOSSARY_RE_CACHE[key] = pat
     return pat
 
 
-def _context_block(context: dict | None, items: list[str]) -> str:
+def _glossary_hit(key: str, variants: tuple, blob: str) -> bool:
+    """术语是否出现在这段文本里（单词按词边界，多词按子串）。"""
+    if " " in key or "-" in key:
+        low = blob.lower()
+        return any(v.lower() in low for v in variants)
+    return _glossary_pattern(key, variants).search(blob) is not None
+
+
+def _glossary_hits(context: dict | None, items: list) -> list:
+    """本批真的出现的术语，**长术语优先，最多 20 条**。
+
+    术语表大了以后，一批里命中几十条是常事，而注入上限是 20 条。
+    必须让更长、更具体的术语优先（marginal revenue > revenue），
+    否则泛词会挤掉真正需要约束的专业词。
+
+    返回值有两个用处：拼提示词（``_context_block``），以及译完之后做
+    「术语到底有没有被遵守」的软校验（``_soft_reason``）。
+    """
+    glossary = (context or {}).get("glossary") or {}
+    if not isinstance(glossary, dict) or not glossary:
+        return []
+    blob = "\n".join(items)
+    hits = []
+    for key, val in glossary.items():
+        key = str(key)
+        if len(key) < 3:
+            continue
+        # ★ 单词术语要按**词边界**匹配：子串匹配会让 firm 命中 confirm、
+        #   cost 命中 cost-effective，把不相干的术语提示塞进提示词，反而误导模型。
+        if _glossary_hit(key, _glossary_variants(key), blob):
+            hits.append((key, val))
+    hits.sort(key=lambda kv: (-len(kv[0]), kv[0]))
+    return hits[:20]
+
+
+def _context_block(context: dict | None, items: list,
+                   hits: list | None = None) -> str:
     """把「文档背景 + 相关术语」拼成提示词里的一小段。
 
     为什么值得加：短行、表格单元格、术语表条目本身没有上下文，孤立翻译时模型
     只能靠猜——实测把 Capital/Capitals 单独拿出来，会得到「首都」「大写字母」，
     而在财务文档上下文里正确答案是「资本」。每批只多几十个 token，
     换来的是术语一致与语境正确。
+
+    ``hits`` 由调用方传入时复用（调用方算过一次，用来做译后校验），
+    避免同一批把 800 条术语匹配跑两遍。
     """
     if not context:
         return ""
@@ -743,31 +845,11 @@ def _context_block(context: dict | None, items: list[str]) -> str:
     if doc_context:
         parts.append("Document context (use it only to disambiguate terminology):\n"
                      + doc_context[:400])
-    glossary = context.get("glossary") or {}
-    if isinstance(glossary, dict) and glossary:
-        blob = "\n".join(items)
-        hits = []
-        for key, val in glossary.items():
-            key = str(key)
-            if len(key) < 3:
-                continue
-            # ★ 单词术语要按**词边界**匹配：子串匹配会让 firm 命中 confirm、
-            #   cost 命中 cost-effective，把不相干的术语提示塞进提示词，反而误导模型。
-            if " " in key or "-" in key:
-                hit = key.lower() in blob.lower()
-            else:
-                # ★ 术语表有 800+ 条时，每批都要跑 800 多次正则；Python 自带的正则缓存
-                #   只有 512 个槽，会不停重编译。这里自己缓存编译结果。
-                hit = _glossary_pattern(key).search(blob) is not None
-            if hit:
-                hits.append((key, val))
-        if hits:
-            # ★ 术语表大了以后，一批里命中几十条是常事，而注入上限是 20 条。
-            #   必须让**更长、更具体**的术语优先（marginal revenue > revenue），
-            #   否则泛词会挤掉真正需要约束的专业词。
-            hits.sort(key=lambda kv: (-len(kv[0]), kv[0]))
-            parts.append("Established terminology (must be followed):\n"
-                         + "; ".join(f"{k} → {v}" for k, v in hits[:20]))
+    if hits is None:
+        hits = _glossary_hits(context, items)
+    if hits:
+        parts.append("Established terminology (must be followed):\n"
+                     + "; ".join(f"{k} → {v}" for k, v in hits))
     if not parts:
         return ""
     return "\n" + "\n".join(parts) + "\n"
@@ -851,18 +933,84 @@ def _validate(values: list[str], sources: list[str], target: str, kind: str) -> 
     return _validate_reason(values, sources, target, kind) == ""
 
 
+# ------------------------------------------------- 软校验（只用来「多打磨一次」）
+#
+# 分工必须分清楚：
+#   • 硬校验（_validate_reason）失败会一路降级 —— 换通道 → 分组重试 → 逐条重试
+#     → 最后**保留原文**。所以它只能放极保守的规则，判错一次就毁掉一段内容。
+#   • 软校验针对的是「大概率译错、但个别情况下也说得通」的问题：数字被吃掉、
+#     术语表没被遵守。这类问题判错了不该毁掉一条正确的译文。
+# 做法：只多给模型**一次**机会，并给出针对性的提示；第二次无论怎样都收下。
+
+NUM_RE = re.compile(r"\d[\d,\s]*")
+# 中文数字（含「百分之五十」这类写法）。用来避免误判：译文用中文数字表达时，
+# 阿拉伯数字当然找不到，那不是「丢数字」。
+CN_NUM_RE = re.compile(r"[一二三四五六七八九十百千万亿零两〇]")
+# 只对「够具体、不歧义」的术语强制：多词，或足够长的单词。
+# 短词反过来会误伤 —— capital 在「the capital of France」里本来就该译「首都」，
+# 硬按术语表逼成「资本」反而错。这类短词继续只在提示词里做建议。
+GLOSSARY_ENFORCE_MIN_LEN = 8
+
+
+def _numbers(text: str) -> set:
+    """抽出数字串，去掉千分位与空格，便于跨写法比对（1,000 与 1000 视作同一个）。"""
+    return {re.sub(r"[,\s]", "", m) for m in NUM_RE.findall(text or "")}
+
+
+def _term_present(en: str, text: str) -> bool:
+    """术语（含复数变体）是否出现在这段原文里。"""
+    en = str(en)
+    return _glossary_hit(en, _glossary_variants(en), text)
+
+
+def _soft_reason(values: list[str], sources: list[str], target: str, kind: str,
+                 terms: list | None = None) -> str:
+    """软校验：返回「值得再打磨一次」的原因，没问题返回空串。
+
+    只查两件事，且**一发现就返回**（每批最多多花一次请求）：
+
+    1. **数字整个丢了**——技术/金融文档里被吃掉的数字是最严重的隐蔽错误，
+       而原来的硬校验只看了数学符号，完全没看数字（``Revenue was $1,234,567``
+       译成「收入很高」是能过校验的）。判定用「一个字面数字都没有、也没有
+       中文数字」这个很紧的条件，所以「百分之五十」「第2章」都不会误判。
+    2. **术语表没被遵守**——提示词里明明写了 "must be followed"，
+       但从来没人检查过。这里只查本批真的注入过、且够具体的术语。
+    """
+    if len(values) != len(sources):
+        return ""
+    for idx, (v, s) in enumerate(zip(values, sources), 1):
+        want = {n for n in _numbers(s) if len(n) >= 2}      # 单位数常写成「二/两」，不查
+        if want and not (_numbers(v) & want) and not CN_NUM_RE.search(v):
+            return (f"第 {idx} 条疑似丢失数字（原文有 {'、'.join(sorted(want)[:3])}，"
+                    f"译文里找不到）：{v[:30]!r}")
+        for en, zh in (terms or []):
+            zh = str(zh)
+            if len(zh) < 2 or len(str(en)) < GLOSSARY_ENFORCE_MIN_LEN:
+                continue
+            if zh not in v and _term_present(en, s):
+                return f"第 {idx} 条未使用约定的术语「{en} → {zh}」：{v[:30]!r}"
+    return ""
+
+
 # ---------------------------------------------------------------- 回调工厂
 
 
-def _correction_hint(reason: str) -> str:
+def _correction_hint(reason: str, soft: bool = False) -> str:
     """把校验原因翻译成给模型的纠正提示。
 
     比笼统的「你被拒了，请一一对应」有效得多，也更不容易把正确的译文带偏——
     之前那句笼统提示里写着 "repeated"，模型会以为「重复」是错的，
     于是把本该相同的译文硬改成不同的词。
+
+    ``soft=True`` 用于软校验：那是「还能更好」，不是「你被拒了」。措辞必须
+    分开——写成「被拒」模型会以为整批不合格，把本来正确的译文也一起改掉。
     """
     base = ("CRITICAL: your previous answer was rejected. Keep the JSON strictly "
             "one-to-one with the input items.\n")
+    if soft:
+        base = ("Your previous answer was accepted. Only fix the points below, keep "
+                "everything else exactly as it was, and keep the JSON strictly "
+                "one-to-one with the input items.\n")
     if "繁体" in reason:
         return base + "Use SIMPLIFIED Chinese only (简体中文), never Traditional (繁體).\n"
     if "省略号" in reason:
@@ -879,6 +1027,12 @@ def _correction_hint(reason: str) -> str:
                        "correct for them to share the same translation.\n")
     if "换行" in reason or "为空" in reason:
         return base + "Every value must be non-empty and on a single line.\n"
+    if "术语" in reason:
+        return base + ("Use the established terminology exactly as listed "
+                       "(e.g. marginal revenue → 边际收益). Do not swap in a synonym.\n")
+    if "数字" in reason:
+        return base + ("You dropped a number. Keep every number from the source exactly "
+                       "as it appears (amounts, percentages, years).\n")
     return base
 
 
@@ -921,7 +1075,7 @@ def make_translator(cfg: dict, source_lang: str = "auto",
     target = _LANG_PROMPT_NAME.get(target_lang, target_lang)
     stats = {
         "chars_in": 0, "chars_out": 0, "calls": 0,
-        "batches": 0, "retries": 0, "failed": 0, "skipped": 0,
+        "batches": 0, "retries": 0, "soft_retries": 0, "failed": 0, "skipped": 0,
         "tokens_in": 0, "tokens_out": 0,      # 接口回的真实用量，用于准确算钱
         "fallbacks": 0, "escalated": 0,       # 走了备用通道 / 走了强通道的批次数
         "by_channel": {},                     # 分通道 token 用量（混合路由下要知道钱花在哪）
@@ -992,7 +1146,8 @@ def make_translator(cfg: dict, source_lang: str = "auto",
             slot["tokens_out"] += tout
             slot["calls"] += 1
 
-    def _try_channel(chan: dict, items: list[str], ctx_block: str) -> list[str] | None:
+    def _try_channel(chan: dict, items: list[str], ctx_block: str,
+                     terms: list | None = None) -> list[str] | None:
         """在**单个通道**上试 MAX_ATTEMPTS 次；成功返回结果，彻底失败返回 None。"""
         extra = ""
         for attempt in range(MAX_ATTEMPTS):
@@ -1044,18 +1199,36 @@ def make_translator(cfg: dict, source_lang: str = "auto",
             else:
                 reason = _validate_reason(parsed, items, target_lang, kind)
                 if not reason:
-                    return parsed
+                    # 硬校验过了，再顺手看一眼「软问题」：数字丢了、术语表没被遵守。
+                    # 只在第一次尝试时多给一次机会，第二次无论怎样都收下——
+                    # 软问题判错的代价，绝不能是丢掉一条正确的译文。
+                    soft = (_soft_reason(parsed, items, target_lang, kind, terms)
+                            if attempt == 0 else "")
+                    if not soft:
+                        return parsed
+                    with lock:
+                        stats["soft_retries"] += 1
+                    say(f"[info] 第 {attempt + 1}/{MAX_ATTEMPTS} 次软校验提示"
+                        f"（{soft}），再打磨一次")
+                    extra = _correction_hint(soft, soft=True)
+                    continue
             with lock:
                 stats["retries"] += 1
             say(f"[warn] 第 {attempt + 1}/{MAX_ATTEMPTS} 次校验未通过（{reason}），重试中")
             extra = _correction_hint(reason)
         return None
 
-    def _one_batch(items: list[str], ctx_block: str = "") -> list[str] | None:
-        """按通道链依次尝试；任一通道成功即返回。全失败返回 None。"""
+    def _one_batch(items: list[str], context: dict | None = None) -> list[str] | None:
+        """按通道链依次尝试；任一通道成功即返回。全失败返回 None。
+
+        术语匹配在这里算一次、给两处用：拼提示词，以及译完之后做
+        「术语到底有没有被遵守」的软校验。所以这里收的是 context，不是拼好的串。
+        """
+        hits = _glossary_hits(context, items)
+        ctx_block = _context_block(context, items, hits)
         chain = _chain_for(items)
         for pos, chan in enumerate(chain):
-            got = _try_channel(chan, items, ctx_block)
+            got = _try_channel(chan, items, ctx_block, hits)
             if got is not None:
                 if pos > 0:                    # 首个通道没扛住，用了后面的
                     with lock:
@@ -1091,7 +1264,7 @@ def make_translator(cfg: dict, source_lang: str = "auto",
         def work(batch: list[tuple[int, str]]):
             texts_only = [t for _, t in batch]
             # 上下文按批计算：术语表只注入「本批真的出现」的词，避免白白塞满提示词
-            return batch, _one_batch(texts_only, _context_block(context, texts_only))
+            return batch, _one_batch(texts_only, context)
 
         if workers <= 1:
             results = [work(b) for b in batches]
@@ -1120,8 +1293,7 @@ def make_translator(cfg: dict, source_lang: str = "auto",
             still: list[tuple[int, str]] = []
             for start in range(0, len(pending), group_size):
                 group = pending[start:start + group_size]
-                res = _one_batch([t for _, t in group],
-                                 _context_block(context, [t for _, t in group]))
+                res = _one_batch([t for _, t in group], context)
                 if res is None:
                     still.extend(group)
                     continue
@@ -1201,7 +1373,7 @@ def make_refiner(draft_translate, refine_cfg: dict | None,
             yield chunk
 
     def _refine_one(batch: list[tuple[int, str, str]],
-                    ctx_block: str = "") -> list[str] | None:
+                    ctx_block: str = "", terms: list | None = None) -> list[str] | None:
         """精修一批；成功返回译文列表，彻底失败返回 None（调用方保留初译）。"""
         pairs = [(s, d) for _i, s, d in batch]
         sources = [s for _i, s, _d in batch]
@@ -1227,7 +1399,14 @@ def make_refiner(draft_translate, refine_cfg: dict | None,
             # 否则精修可以悄悄把公式删掉而没人发现
             reason = _validate_reason(parsed, sources, target_lang, kind)
             if not reason:
-                return parsed
+                # 精修最容易犯的两个错：顺手把术语改成同义词、把数字改写掉。
+                # 这里同样过一遍软校验，也只多给一次机会就收手（第二次照收）。
+                soft = (_soft_reason(parsed, sources, target_lang, kind, terms)
+                        if attempt == 0 else "")
+                if not soft:
+                    return parsed
+                say(f"[info] 精修软校验提示（{soft}），再打磨一次")
+                continue
             say(f"[warn] 精修结果校验未通过（{reason}）")
         return None
 
@@ -1249,7 +1428,9 @@ def make_refiner(draft_translate, refine_cfg: dict | None,
             say(f"  精修 {len(todo)} 条（{len(batches)} 批）")
 
             def work(batch):
-                return batch, _refine_one(batch, _context_block(context, [s for _i, s, _d in batch]))
+                srcs = [s for _i, s, _d in batch]
+                hits = _glossary_hits(context, srcs)
+                return batch, _refine_one(batch, _context_block(context, srcs, hits), hits)
 
             if workers <= 1:
                 results = [work(b) for b in batches]

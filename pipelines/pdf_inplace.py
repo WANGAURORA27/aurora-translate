@@ -490,7 +490,10 @@ def _prefetch_translations(doc, translate, cache_dir, options, target_lang, emit
             else:
                 wanted.append(entry)
         wanted_lines += len(wanted)
-        for unit in _merge_units(wanted):
+        # 行距基线用**整页**的行来估：wanted 已经滤掉了不翻译的行，
+        # 只按它估会把行距算大，反而容易误合并相邻段落
+        gap_base = _gap_baseline(_line_columns(entries))
+        for unit in _merge_units(wanted, gap_base):
             unit_meta.append((i, unit, _unit_text([by_id[k] for k in unit]),
                               [max(1.0, by_id[k]["rect"].width) for k in unit]))
 
@@ -694,7 +697,41 @@ def _unit_text(unit):
     return out.strip()
 
 
-def _can_merge(prev, nxt):
+# 合并用的「正常行距」基线。
+#
+# ★ 原来的阈值是写死的：max(6pt, 0.75×字号)。注释里说这是拿 Word 生成的 PDF
+#   标定的（行间隙≈2pt、段间距 8~11pt，相差一个数量级）。但**行距松的文档**
+#   ——LaTeX 的 \onehalfspacing、InDesign 排版、很多教材和期刊——行间隙本来
+#   就有 8~12pt，这个阈值直接把同一句话的换行判成"新段落"，于是永远合不上：
+#   每一行都被当成独立片段送翻译，译文自然"半句拼不上、上下文断裂"，
+#   甚至把下一行的内容猜进上一行去。
+#   实测 samples/demo.pdf：两行间隙 11.68pt > 阈值 8.25pt，一句话被劈成两个单元。
+# 改成按本页真实行距自适应，绝对阈值保留作兜底。
+GAP_BASELINE_MIN_SAMPLES = 4    # 样本太少就不猜，退回绝对阈值（否则两行就能"证明"任何间距）
+GAP_BASELINE_PCT = 0.2          # 取低分位：被跳过的行（纯数字/表格）会留下大间隙
+GAP_BASELINE_REL = 1.35         # 允许行间隙比基线略大
+
+
+def _gap_baseline(columns) -> float:
+    """估计本页「正常行距」：同列相邻行间隙的低分位（pt）。样本不足返回 0（不启用）。
+
+    为什么取**低分位**而不是中位数：``_merge_units`` 拿到的常常是"需要翻译的行"，
+    其中被跳过的行（纯数字、表格里的符号）会在列表里留下被拉大的间隙；
+    低分位天然忽略这类离群值，取到的才是真正的行间距。
+    """
+    gaps = []
+    for col in columns:
+        for a, b in zip(col, col[1:]):
+            gap = b["rect"].y0 - a["rect"].y1
+            if gap > 0:
+                gaps.append(gap)
+    if len(gaps) < GAP_BASELINE_MIN_SAMPLES:
+        return 0.0
+    gaps.sort()
+    return gaps[int(len(gaps) * GAP_BASELINE_PCT)]
+
+
+def _can_merge(prev, nxt, gap_baseline=0.0):
     """判定 ``nxt`` 是否是 ``prev`` 的续行（两个 entry：i/rect/text/size）。
 
     全部条件都满足才合并 —— 刻意保守，宁可漏合并（退回逐行翻译，最多是旧行为），
@@ -703,8 +740,12 @@ def _can_merge(prev, nxt):
       2. 下一行首字母是小写 ASCII（先剥掉行首引号/括号），或以续行标点开头；
       3. 下一行不是列表项/编号开头（``1.`` / ``•`` / ``(a)`` / ``a) ``）；
       4. 同列：左缘 x0 相差 ≤15pt；
-      5. 行距正常：间隙 = 下一行 y0 − 上一行 y1，落在 [−3pt, max(6pt, 0.75×字号)]；
+      5. 行距正常：间隙 = 下一行 y0 − 上一行 y1，落在
+         [−3pt, max(6pt, 0.75×字号, ``gap_baseline`` × 1.35)]；
       6. 字号接近：相差 ≤1.5pt。
+
+    第 5 条里的 ``gap_baseline`` 由 ``_gap_baseline`` 按本页真实行距算出——
+    没有它，行距松的文档一句话永远合不上。
     """
     p = (prev.get("text") or "").strip()
     n = (nxt.get("text") or "").strip()
@@ -723,9 +764,12 @@ def _can_merge(prev, nxt):
     pr, nr = prev["rect"], nxt["rect"]
     if abs(nr.x0 - pr.x0) > MERGE_X_TOL:
         return False
-    # 5) 行距正常
+    # 5) 行距正常：绝对阈值兜底，再按本页真实行距放宽（行距松的文档靠这条）
     gap = nr.y0 - pr.y1
-    if gap < -3.0 or gap > max(MERGE_GAP_ABS, MERGE_GAP_RATIO * prev["size"]):
+    limit = max(MERGE_GAP_ABS, MERGE_GAP_RATIO * prev["size"])
+    if gap_baseline > 0.0:
+        limit = max(limit, gap_baseline * GAP_BASELINE_REL)
+    if gap < -3.0 or gap > limit:
         return False
     # 6) 字号接近
     if abs(nxt["size"] - prev["size"]) > MERGE_SIZE_TOL:
@@ -747,20 +791,27 @@ def _line_columns(entries):
     return [sorted(col, key=lambda e: (e["rect"].y0, e["rect"].x0)) for col in cols]
 
 
-def _merge_units(entries):
+def _merge_units(entries, gap_baseline=None):
     """把行合并成翻译单元，返回 ``[[行号, ...], ...]``（单行单元也原样保留）。
 
     单元最终按"单元内最小行号"排序 —— 与上游逐行的批内顺序保持一致，
     这样译文与行的对应关系、以及译文写进缓存的顺序都不变。
+
+    ``gap_baseline`` 省略时由 ``entries`` 自己估计；调用方若能拿到**整页**的行，
+    应该把整页算出来的基线传进来 —— 因为 ``entries`` 常常已经滤掉了不需要翻译的行
+    （纯数字、表格符号），只按它估计会把行距算大，反而容易误合并。
     """
+    columns = _line_columns(entries)
+    if gap_baseline is None:
+        gap_baseline = _gap_baseline(columns)
     units = []
-    for col in _line_columns(entries):
+    for col in columns:
         cur = []
         for entry in col:
             if not cur:
                 cur = [entry]
                 continue
-            if _can_merge(cur[-1], entry):
+            if _can_merge(cur[-1], entry, gap_baseline):
                 if len(cur) >= MERGE_MAX_LINES:
                     units.append(cur)
                     cur = [entry]
@@ -941,7 +992,44 @@ def _rect_close(a, b, tol=RECT_TOL):
             and abs(a.x1 - b.x1) <= tol and abs(a.y1 - b.y1) <= tol)
 
 
-def _free_band(page_rect, all_rects, drawn_boxes, rect):
+def _obstacle_rects(page, min_side=12.0):
+    """本页需要给译文让路的**图片与成块图形**的矩形。
+
+    ★ 为什么必须有这个：``_free_band`` 原来只认文字行，图片完全不参与几何计算。
+      于是紧挨图片上方（或下方）的那行文字，它的下界只能看到"下一个文字行"——
+      那往往在图片另一侧老远的地方，译文一折行就**铺到图上**。
+      用户反馈的"遇到图片就出问题、影响较大"就是它。
+
+    两类都收：
+      * 位图（``get_image_info``）;
+      * 成块的矢量图形（填色、且宽高都 ≥ ``min_side``）——很多教材的插图是矢量画的，
+        demo.pdf 里那个"图"就是矢量矩形而不是位图。
+        细线（表格线、分隔线）和小装饰靠 ``min_side`` 排除。
+
+    用不用得上由 ``_free_band`` 再判：只有**完全位于本行上方/下方**的障碍才约束；
+    文字本来就压在图上（障碍把本行整个包住）时不约束 —— 否则空白带会被压成负高度。
+    """
+    rects = []
+    try:
+        for info in page.get_image_info():
+            r = fitz.Rect(info["bbox"])
+            if r.width >= 1.0 and r.height >= 1.0:
+                rects.append(r)
+    except Exception:                       # noqa: BLE001
+        pass
+    try:
+        for g in page.get_drawings():
+            if not g.get("fill"):
+                continue                    # 只有描边（表格线、分隔线）不算障碍
+            r = fitz.Rect(g["rect"])
+            if r.width >= min_side and r.height >= min_side:
+                rects.append(r)
+    except Exception:                       # noqa: BLE001
+        pass
+    return rects
+
+
+def _free_band(page_rect, all_rects, drawn_boxes, rect, obstacles=()):
     """给出该行可用的垂直空白带 ``[top, bottom]``。
 
     上界 = max(上方最近文字行的底、上方已绘译文墨迹的底) + V_PAD
@@ -957,6 +1045,10 @@ def _free_band(page_rect, all_rects, drawn_boxes, rect):
     它的墨迹可能低于它自己的原行矩形，必须一起避让。
 
     只统计**水平方向与本行重叠**的文字行：分栏排版里左右两栏互不构成垂直约束。
+
+    ``obstacles`` 是图片与成块图形（见 ``_obstacle_rects``）。它们只在**完全位于
+    本行上方或下方**时才收窄空白带 —— 文字本来就压在图上时不受约束，
+    否则空白带会被压成负高度，译文反而被挤没。
     """
     top = page_rect.y0 + 1.0
     bottom = page_rect.y1 - 1.0
@@ -981,6 +1073,16 @@ def _free_band(page_rect, all_rects, drawn_boxes, rect):
         #   看着像"散架"（几何脚本 + 新旧渲染对比抓到的真问题）。
         if bx1 > x0 and bx0 < x1 and ink_bottom <= rect.y1 and ink_bottom > top:
             top = ink_bottom
+    for r in obstacles:
+        # 图片/图形只在自己**完全在本行上方或下方**时才约束（理由见 docstring）
+        if r.x1 <= x0 or r.x0 >= x1:
+            continue
+        if r.y1 <= rect.y0:
+            if r.y1 > top:
+                top = r.y1
+        elif r.y0 >= rect.y1:
+            if r.y0 < bottom:
+                bottom = r.y0
     return top + V_PAD, bottom - V_PAD
 
 
@@ -1228,6 +1330,8 @@ def _draw_page_inplace(page, pno, work, trans, cjk_scale, sim_bold,
                 if not any(_rect_close(r, d) for d in drawn_rects)]
     # 上下界要用"页面上所有文字行"，所以把要重画的原行也放回来（见 _free_band 注释）
     all_rects = reserved + drawn_rects
+    # 图片与成块图形也要参与避让：否则紧挨图片的那行文字一折行就铺到图上
+    obstacles = _obstacle_rects(page)
 
     ok_work = [(p["i"], p["rect"], p["text"], p["size"], p["color"], p["bold"],
                 p["base"], p["specials"]) for p in plans.values()]
@@ -1239,7 +1343,8 @@ def _draw_page_inplace(page, pno, work, trans, cjk_scale, sim_bold,
     for para in pt.group_paragraphs(ok_work):
         for k, (i, rect, _t, _s, color, bold, _base, specials) in enumerate(para):
             p = plans[i]
-            band_top, band_bot = _free_band(page_rect, all_rects, drawn_boxes, rect)
+            band_top, band_bot = _free_band(page_rect, all_rects, drawn_boxes, rect,
+                                            obstacles)
             plan = _plan_line(p["zh"], rect, p["size"], cjk_scale,
                               band_top, band_bot, p["base"], p["cover_only"])
             bg = pt.sample_bg_color(bg_pix, rect, 150)
