@@ -271,10 +271,10 @@ function overLimit(req, kind, seconds) {
   }
   return null;
 }
-function estAudioSeconds(len, contentType) {
-  const ct = String(contentType || '');
-  if (ct.includes('wav')) return Math.max(0, (len - 44) / 32000);   // 16k 单声道 16bit
-  return len / 4000;                                              // 压缩格式粗估
+function estAudioSeconds(buf) {
+  const info = readWavInfo(buf);
+  if (info && info.sampleRate > 0) return Math.max(0, info.dataLen / (info.sampleRate * Math.max(1, info.channels) * (info.bits / 8)));
+  return Math.max(0, (buf.length - 44) / 32000);   // 非 WAV/解析失败：按 16k 单声道 16bit 粗估
 }
 
 // ---------- 管理员面板：错误日志环形缓冲 ----------
@@ -568,35 +568,104 @@ async function callResponsesOnce({ baseUrl, apiKey, model, instructions, input, 
   return String(out || '').trim();
 }
 // 音频前处理：16k 单声道 PCM16 WAV 的音量归一化（远场/小声说话时显著提升识别率）
-function normalizeWav(buf) {
+// 解析 WAV 头：返回 { sampleRate, channels, bits, dataOff, dataLen }；非标准 WAV 返回 null
+function readWavInfo(buf) {
   try {
-    if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return buf;
-    // 找 data 块
-    let off = 12, dataOff = -1, dataLen = 0;
+    if (!buf || buf.length < 44) return null;
+    if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return null;
+    let off = 12, fmt = null, dataOff = -1, dataLen = 0;
     while (off + 8 <= buf.length) {
       const id = buf.toString('ascii', off, off + 4);
       const sz = buf.readUInt32LE(off + 4);
-      if (id === 'data') { dataOff = off + 8; dataLen = Math.min(sz, buf.length - off - 8); break; }
+      if (id === 'fmt ') {
+        fmt = {
+          audioFormat: buf.readUInt16LE(off + 8),
+          channels: buf.readUInt16LE(off + 10),
+          sampleRate: buf.readUInt32LE(off + 12),
+          bits: buf.readUInt16LE(off + 22),
+        };
+      } else if (id === 'data') {
+        dataOff = off + 8; dataLen = Math.min(sz, buf.length - off - 8); break;
+      }
       off += 8 + sz + (sz % 2);
     }
-    if (dataOff < 0 || dataLen < 320) return buf;
-    const n = Math.floor(dataLen / 2);
-    let sum = 0, peak = 0;
-    const smp = new Int16Array(n);
-    for (let i = 0; i < n; i++) { const v = buf.readInt16LE(dataOff + i * 2); smp[i] = v; sum += v * v; const a = Math.abs(v); if (a > peak) peak = a; }
-    const rms = Math.sqrt(sum / n);
-    if (rms < 1) return buf;                        // 近乎静音：不动
-    if (rms >= 1200 || peak === 0) return buf;      // 音量正常 → 不做任何处理（实测改动反而有风险）
-    let gain = 3600 / rms;
-    if (gain > 4) gain = 4;                         // 最多放大 12 dB，只救“确实很小声”的录音
-    if (peak * gain > 32767) gain = 32767 / peak;   // 防削波
-    if (gain <= 1.05) return buf;
-    for (let i = 0; i < n; i++) {
-      let v = Math.round(smp[i] * gain);
-      if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
-      buf.writeInt16LE(v, dataOff + i * 2);
+    if (!fmt || dataOff < 0) return null;
+    return { ...fmt, dataOff, dataLen };
+  } catch { return null; }
+}
+// 16-bit PCM WAV → 单声道 Float32（立体声取平均，缩放至 [-1,1]）
+function wavToMonoFloat(buf, info) {
+  const ch = Math.max(1, info.channels || 1);
+  const frames = Math.floor(info.dataLen / 2 / ch);
+  const out = new Float32Array(frames);
+  for (let i = 0; i < frames; i++) {
+    let acc = 0;
+    for (let c = 0; c < ch; c++) acc += buf.readInt16LE(info.dataOff + (i * ch + c) * 2);
+    out[i] = acc / ch / 32768;
+  }
+  return out;
+}
+// 重采样到 16kHz：整数倍用盒式低通+抽点（抗混叠），非整数倍用线性插值
+function resample16k(samples, fromRate) {
+  const toRate = 16000;
+  if (fromRate === toRate || fromRate <= 0) return samples;
+  const ratio = fromRate / toRate;
+  const outLen = Math.max(1, Math.round(samples.length / ratio));
+  const out = new Float32Array(outLen);
+  const r = Math.round(ratio);
+  if (r >= 2 && Math.abs(r - ratio) < 0.001) {      // 整数倍（如 48k→16k = 3）
+    for (let i = 0; i < outLen; i++) {
+      let acc = 0; const start = i * r;
+      for (let j = 0; j < r; j++) acc += samples[start + j] || 0;
+      out[i] = acc / r;
     }
-    return buf;
+  } else {                                          // 非整数倍（如 44.1k→16k）
+    for (let i = 0; i < outLen; i++) {
+      const pos = i * ratio, i0 = Math.floor(pos), frac = pos - i0;
+      const a = samples[i0] || 0;
+      const b = samples[i0 + 1] !== undefined ? samples[i0 + 1] : a;
+      out[i] = a + (b - a) * frac;
+    }
+  }
+  return out;
+}
+// Float32 单声道 → 16kHz 16-bit WAV Buffer
+function floatToWav16k(samples) {
+  const n = samples.length;
+  const buf = Buffer.alloc(44 + n * 2);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write('WAVE', 8);
+  buf.write('fmt ', 12); buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(16000, 24); buf.writeUInt32LE(32000, 28);
+  buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34);
+  buf.write('data', 36); buf.writeUInt32LE(n * 2, 40);
+  for (let i = 0; i < n; i++) {
+    let s = samples[i];
+    if (s > 1) s = 1; else if (s < -1) s = -1;
+    buf.writeInt16LE(s < 0 ? Math.round(s * 32768) : Math.round(s * 32767), 44 + i * 2);
+  }
+  return buf;
+}
+// 音频前处理：统一到 16kHz 单声道（Qwen3-ASR / Whisper 原生采样率）+ 音量归一化
+function normalizeWav(buf) {
+  try {
+    const info = readWavInfo(buf);
+    if (!info || info.dataLen < 320) return buf;
+    // ① 重采样到 16kHz（前端按 AudioContext 采样率采集，桌面浏览器默认 48k，直接送 16k 模型会“快 3 倍”）
+    let samples = wavToMonoFloat(buf, info);
+    if (info.sampleRate !== 16000) samples = resample16k(samples, info.sampleRate);
+    // ② 音量归一化：只救“确实很小声”的录音，正常音量不动（实测改动反而有风险）
+    const n = samples.length;
+    let sum = 0, peak = 0;
+    for (let i = 0; i < n; i++) { const v = samples[i]; sum += v * v; const a = Math.abs(v); if (a > peak) peak = a; }
+    const rms = Math.sqrt(sum / n);
+    if (rms >= 3.05e-5 && rms < 0.0366 && peak > 0) {   // 1200/32768≈0.0366：正常音量下限
+      let gain = (3600 / 32768) / rms;                  // 放大目标 RMS
+      if (gain > 4) gain = 4;                           // 最多放大 12 dB
+      if (peak * gain > 0.99997) gain = 0.99997 / peak; // 防削波
+      if (gain > 1.05) for (let i = 0; i < n; i++) samples[i] = samples[i] * gain;
+    }
+    return floatToWav16k(samples);
   } catch { return buf; }
 }
 
@@ -1012,7 +1081,7 @@ async function handleStt(req, res, query) {
   let buf;
   try { buf = await readBody(req); } catch (e) { return errJson(res, e.status || 400, e.message); }
   if (buf.length < 100) return errJson(res, 400, '音频为空');
-  const secs = estAudioSeconds(buf.length, req.headers['content-type']);
+  const secs = estAudioSeconds(buf);
   const limStt = overLimit(req, 'stt', secs);
   if (limStt) return errJson(res, 429, limStt);
   bumpUsage(req, 'stt', secs);
