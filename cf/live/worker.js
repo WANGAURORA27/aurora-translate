@@ -1463,6 +1463,42 @@ function makeRes(wantsStream) {
   return { res, stream };
 }
 
+/** 实时识别桥接：浏览器 WS ↔ 百炼 qwen3-asr-realtime WS（纯透传，协议由前端处理） */
+async function handleSttWs(request, env) {
+  let key = "", model = "qwen3-asr-flash-realtime";
+  try {
+    const pf = JSON.parse(PE("PROFILES_JSON") || "{}");
+    const sn = pf.snow || {};
+    key = sn.sttApiKey || sn.apiKey || "";
+    model = sn.sttRealtimeModel || "qwen3-asr-flash-realtime";
+  } catch (e) {}
+  if (!key) {
+    return new Response(JSON.stringify({ error: "实时识别未配置密钥" }),
+      { status: 500, headers: { "content-type": "application/json; charset=utf-8" } });
+  }
+  const dashUrl = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=" + encodeURIComponent(model);
+  const dashResp = await fetch(dashUrl, {
+    headers: { "Upgrade": "websocket", "Authorization": "Bearer " + key, "X-DashScope-Token": key },
+  }).catch(() => null);
+  if (!dashResp || !dashResp.webSocket) {
+    return new Response(JSON.stringify({ error: "无法连接实时识别通道" }),
+      { status: 502, headers: { "content-type": "application/json; charset=utf-8" } });
+  }
+  const dashWs = dashResp.webSocket;
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+  server.accept();
+  server.addEventListener("message", (ev) => { try { dashWs.send(ev.data); } catch (e) {} });
+  dashWs.addEventListener("message", (ev) => { try { server.send(ev.data); } catch (e) {} });
+  const closeAll = () => { try { server.close(1011, "closed"); } catch (e) {} try { dashWs.close(1000, "bye"); } catch (e) {} };
+  server.addEventListener("close", () => { try { dashWs.close(1000, "bye"); } catch (e) {} });
+  server.addEventListener("error", closeAll);
+  dashWs.addEventListener("close", () => { try { server.close(1000, "bye"); } catch (e) {} });
+  dashWs.addEventListener("error", closeAll);
+  return new Response(null, { status: 101, webSocket: client });
+}
+
 export default {
   async fetch(request, env, ctx) {
     LIVE_ENV = env || {};
@@ -1471,6 +1507,16 @@ export default {
 
     let url;
     try { url = new URL(request.url); } catch (e) { return new Response("bad url", { status: 400 }); }
+
+    // 实时识别 WebSocket 桥接（浏览器 ↔ 阿里百炼 qwen3-asr-realtime，密钥留在服务端）
+    if (url.pathname === "/api/stt-ws" && String(request.headers.get("upgrade") || "").toLowerCase() === "websocket") {
+      const who = await cachedUser(env, request);
+      if (!who) {
+        return new Response(JSON.stringify({ error: "请先登录后再使用同声传译" }),
+          { status: 401, headers: { "content-type": "application/json; charset=utf-8" } });
+      }
+      return await handleSttWs(request, env);
+    }
 
     // 登录门：静态页面与健康检查放行，其余 API 必须带账户会话
     if (url.pathname.startsWith("/api/")
