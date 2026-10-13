@@ -1,0 +1,19 @@
+# LiveBridge 实时同声传译 · Cloudflare 版（测试环境）
+# 与线上 aurora-live 共用同一份业务代码，但独立部署，用于验证新功能（如实时流式识别）
+
+name = "aurora-live-staging"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# 与账户站共用同一个 D1：校验登录会话（登录态在 .ourmetaverse.cn 下全子域共享）
+[[d1_databases]]
+binding = "DB"
+database_name = "aurora-account"
+database_id = "90980376-a702-4617-a3c0-1fd2798e7179"
+
+[vars]
+MOCK = "0"

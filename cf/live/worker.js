@@ -1485,12 +1485,13 @@ async function handleSttWs(request, env) {
       { status: 502, headers: { "content-type": "application/json; charset=utf-8" } });
   }
   const dashWs = dashResp.webSocket;
+  console.log("[stt-ws] 百炼WS已建立");
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
   server.accept();
-  server.addEventListener("message", (ev) => { try { dashWs.send(ev.data); } catch (e) {} });
-  dashWs.addEventListener("message", (ev) => { try { server.send(ev.data); } catch (e) {} });
+  server.addEventListener("message", (ev) => { console.log("[stt-ws] 浏览器→百炼:", typeof ev.data === "string" ? ev.data.slice(0,60) : "binary"); try { dashWs.send(ev.data); } catch (e) {} });
+  dashWs.addEventListener("message", (ev) => { console.log("[stt-ws] 百炼→浏览器:", typeof ev.data === "string" ? ev.data.slice(0,120) : "binary"); try { server.send(ev.data); } catch (e) {} });
   const closeAll = () => { try { server.close(1011, "closed"); } catch (e) {} try { dashWs.close(1000, "bye"); } catch (e) {} };
   server.addEventListener("close", () => { try { dashWs.close(1000, "bye"); } catch (e) {} });
   server.addEventListener("error", closeAll);
